@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LinkedIn Bulk Resume Downloader</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────── */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 360px;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #f3f2ef;
+      color: #333;
+    }
+
+    /* ── Header ───────────────────────────────────── */
+    .header {
+      background: linear-gradient(135deg, #0a66c2, #004182);
+      color: #fff;
+      padding: 18px 20px;
+      text-align: center;
+    }
+    .header h1 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+    .header p {
+      font-size: 11px;
+      opacity: 0.85;
+      margin-top: 4px;
+    }
+
+    /* ── Body ─────────────────────────────────────── */
+    .body {
+      padding: 18px 20px;
+    }
+
+    /* ── Status Badge ─────────────────────────────── */
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      font-size: 12.5px;
+    }
+    .status-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.idle        { background: #999; }
+    .status-dot.scanning    { background: #f5a623; }
+    .status-dot.running     { background: #0a66c2; animation: pulse 1.4s infinite; }
+    .status-dot.done        { background: #057642; }
+    .status-dot.error       { background: #cc1016; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.4; }
+    }
+
+    /* ── Stats Row ────────────────────────────────── */
+    .stats {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .stat-card {
+      flex: 1;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .stat-card .number {
+      font-size: 22px;
+      font-weight: 700;
+      color: #0a66c2;
+    }
+    .stat-card .label {
+      font-size: 10.5px;
+      color: #666;
+      margin-top: 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* ── Progress Bar ─────────────────────────────── */
+    .progress-container {
+      margin-bottom: 16px;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11.5px;
+      color: #666;
+      margin-bottom: 6px;
+    }
+    .progress-bar-bg {
+      width: 100%;
+      height: 8px;
+      background: #e0e0e0;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #0a66c2, #057642);
+      border-radius: 4px;
+      transition: width 0.4s ease;
+    }
+
+    /* ── Buttons ───────────────────────────────────── */
+    .actions {
+      display: flex;
+      gap: 10px;
+    }
+    .btn {
+      flex: 1;
+      padding: 10px 0;
+      border: none;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: #0a66c2;
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: #004182;
+    }
+    .btn-danger {
+      background: #fff;
+      color: #cc1016;
+      border: 1.5px solid #cc1016;
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: #cc1016;
+      color: #fff;
+    }
+
+    /* ── Log Area ──────────────────────────────────── */
+    .log-area {
+      margin-top: 16px;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      max-height: 120px;
+      overflow-y: auto;
+      padding: 10px 12px;
+      font-size: 11px;
+      color: #555;
+      line-height: 1.7;
+    }
+    .log-area:empty::before {
+      content: "Activity log will appear here…";
+      color: #aaa;
+      font-style: italic;
+    }
+    .log-area pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: 10px;
+      background: #f8f8f8;
+      padding: 6px;
+      border-radius: 4px;
+      margin: 4px 0;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .log-entry.error { color: #cc1016; }
+    .log-entry.success { color: #057642; }
+
+    /* ── Footer ───────────────────────────────────── */
+    .footer {
+      text-align: center;
+      padding: 10px;
+      font-size: 10px;
+      color: #999;
+      border-top: 1px solid #e8e8e8;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1>📄 LinkedIn Bulk Resume Downloader</h1>
+    <p>Download applicant resumes with human-like delays</p>
+  </div>
+
+  <div class="body">
+
+    <!-- Status -->
+    <div class="status-badge">
+      <span class="status-dot idle" id="statusDot"></span>
+      <span id="statusText">Waiting — open a LinkedIn Hiring page</span>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat-card">
+        <div class="number" id="foundCount">0</div>
+        <div class="label">Found</div>
+      </div>
+      <div class="stat-card">
+        <div class="number" id="downloadedCount">0</div>
+        <div class="label">Downloaded</div>
+      </div>
+      <div class="stat-card">
+        <div class="number" id="failedCount">0</div>
+        <div class="label">Failed</div>
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-container">
+      <div class="progress-header">
+        <span id="progressLabel">Downloaded 0 of 0</span>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressBarFill"></div>
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="actions">
+      <button class="btn btn-primary" id="btnStart" disabled>⏳ Checking…</button>
+      <button class="btn btn-danger" id="btnStop" disabled>■ Stop</button>
+    </div>
+    <div style="margin-top:10px">
+      <button class="btn btn-primary" id="btnDebug" style="width:100%;background:#555">🔍 Debug Scan Page</button>
+    </div>
+
+    <!-- Log -->
+    <div class="log-area" id="logArea"></div>
+  </div>
+
+  <div class="footer">
+    Use responsibly &amp; respect LinkedIn's Terms of Service
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
