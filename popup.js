@@ -172,7 +172,8 @@ function runDebugScan() {
 
     const d = response.debug;
     addLog(`Page: ${d.url}`, "info");
-    addLog(`Total buttons: ${d.totalButtons} | Total links: ${d.totalLinks}`, "info");
+    addLog(`UI: ${d.hiringUI ? "Hiring Manager" : "Talent/Recruiter"} | List items: ${d.hiringListItems ?? "?"}`, "info");
+    addLog(`Total buttons: ${d.totalButtons ?? "?"} | Total links: ${d.totalLinks ?? "?"}`, "info");
     addLog(`Applicant cards found: ${d.applicantCardsFound}`, d.applicantCardsFound > 0 ? "success" : "error");
 
     // List applicant names found
@@ -183,8 +184,20 @@ function runDebugScan() {
       });
     }
 
-    // Resume button status
-    addLog(`Resume button visible in detail panel: ${d.resumeButtonVisible ? "YES (" + d.resumeButtonText + ")" : "NO"}`, d.resumeButtonVisible ? "success" : "info");
+    if (d.detailPanelName) {
+      addLog(`Detail panel name: ${d.detailPanelName}`, "success");
+    }
+
+    // Resume button / Hiring download status
+    addLog(
+      `Resume download available: ${d.resumeButtonVisible ? "YES (" + (d.resumeButtonText || "found") + ")" : "NO — open an applicant first"}`,
+      d.resumeButtonVisible ? "success" : "info"
+    );
+    addLog(`ui-attachment download: ${d.uiAttachmentDownload ? "YES" : "NO"}`, d.uiAttachmentDownload ? "success" : "info");
+    addLog(`Resume viewer icon: ${d.resumeViewerDownloadIcon ? "YES" : "NO"}`, d.resumeViewerDownloadIcon ? "success" : "info");
+    if (d.hiringResumeUrlPreview) {
+      addLog(`Resume URL: ${d.hiringResumeUrlPreview}…`, "success");
+    }
     addLog(`Download icon visible: ${d.downloadIconVisible ? "YES" : "NO"}`, "info");
 
     // data-view-name buttons
@@ -197,7 +210,7 @@ function runDebugScan() {
 
     // Relevant buttons
     if (d.relevantButtons && d.relevantButtons.length > 0) {
-      addLog(`── Buttons with Resume/Download text (${d.relevantButtons.length}):`, "info");
+      addLog(`── Buttons with Resume/Download/More text (${d.relevantButtons.length}):`, "info");
       d.relevantButtons.forEach((b) => {
         addLog(`  "${b.text}" view=${b.dataViewName}`, "info");
       });

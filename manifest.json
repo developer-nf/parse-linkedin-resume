@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Bulk Resume Downloader",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bulk download resumes from LinkedIn Job Applicant pages with human-like delays to avoid detection.",
   "permissions": [
     "downloads",

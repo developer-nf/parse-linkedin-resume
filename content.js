@@ -1,14 +1,17 @@
 /**
- * content.js – LinkedIn Bulk Resume Downloader  (v5)
+ * content.js – LinkedIn Bulk Resume Downloader  (v6)
  *
- * LinkedIn uses obfuscated/hashed CSS class names that change frequently,
- * so we detect elements by STRUCTURE and CONTENT, not class names.
+ * Supports two LinkedIn UIs:
  *
- * Flow per applicant:
- *   1. Click applicant card in LEFT list → loads detail in RIGHT panel
- *   2. Click "Resume" button (has data-view-name or svg#document-small)
- *   3. Click "Download" button (has svg#download-small) in popup
- *   4. Close popup → wait 5-15 s → next applicant
+ * A) Hiring Manager (/hiring/jobs/.../applicants/...) — MOST COMMON
+ *    1. Click .hiring-applicants__list-item in left list
+ *    2. Wait for right panel + resume viewer
+ *    3. Grab PDF from .ui-attachment__download-button OR
+ *       .hiring-resume-viewer__pdf-download-link-icon → <a href>
+ *    4. fetch(blob) download — no separate "Resume" button
+ *
+ * B) Talent Hub / newer Recruiter (data-view-name UI)
+ *    1. Click card → Resume button → Download button → close popup
  */
 
 // Allow re-injection on extension reload
@@ -122,15 +125,43 @@ if (window.__lbrd_cleanup) {
   //  SCAN — find applicant cards using CONTENT-BASED detection
   // ══════════════════════════════════════════════════════════
 
+  const INVALID_CARD_NAMES = new Set([
+    "message", "rate_as", "more", "unknown_candidate", "see_full_profile",
+    "applicants", "shortlist", "all_applicants",
+  ]);
+
+  function isInvalidCardName(name) {
+    const n = (name || "").toLowerCase();
+    return !n || INVALID_CARD_NAMES.has(n) || n.startsWith("rate_");
+  }
+
   function scanApplicantCards() {
     const found = new Map();
+
+    // ── Strategy 0: Classic Hiring Manager list (LinkedIn Jobs Hiring) ──
+    // Matches: https://www.linkedin.com/hiring/jobs/.../applicants/...
+    document.querySelectorAll(".hiring-applicants__list-item").forEach((el) => {
+      const name = extractNameFromCard(el);
+      if (!isInvalidCardName(name) || name === "Unviewed_applicant") {
+        found.set(el, name === "Unknown_Candidate" ? "Unviewed_applicant" : name);
+      }
+    });
 
     // ── Strategy 1: data-view-name on applicant items ──
     // LinkedIn often puts data-view-name on list items
     document.querySelectorAll('[data-view-name*="applicant" i]').forEach((el) => {
-      if (!found.has(el)) found.set(el, extractNameFromCard(el));
+      if (!found.has(el)) {
+        const name = extractNameFromCard(el);
+        if (!isInvalidCardName(name) || name === "Unviewed_applicant") {
+          found.set(el, name);
+        }
+      }
     });
 
+    // Skip fuzzy strategies when Hiring Manager list already matched (avoids "Message" false positives)
+    const hasHiringList = found.size > 0 && !!document.querySelector(".hiring-applicants__list-item");
+
+    if (!hasHiringList) {
     // Also check componentkey items (LinkedIn uses this extensively)
     document.querySelectorAll('[componentkey]').forEach((el) => {
       // Only cards in a list-like context, not the detail panel
@@ -155,7 +186,7 @@ if (window.__lbrd_cleanup) {
         if (!isDuplicate) found.set(el, extractNameFromCard(el));
       }
     });
-
+    }
     // ── Strategy 2: Find the list container and its children ──
     // The left panel is usually a scrollable container with repeating children
     if (found.size === 0) {
@@ -277,6 +308,13 @@ if (window.__lbrd_cleanup) {
     }
     for (const el of toRemove) found.delete(el);
 
+    // Drop junk cards (e.g. Message button mistaken as an applicant)
+    for (const [el, name] of [...found.entries()]) {
+      if (isInvalidCardName(name) && name !== "Unviewed_applicant") {
+        found.delete(el);
+      }
+    }
+
     applicantCards = [...found].map(([el, name]) => ({ element: el, name }));
     log(`Scan complete: ${applicantCards.length} applicant(s) found.`);
     if (applicantCards.length > 0) {
@@ -286,11 +324,8 @@ if (window.__lbrd_cleanup) {
   }
 
   function extractNameFromCard(card) {
-    // Look for the first bold/name-like text that appears to be a person name
-    // Names on LinkedIn are usually: "FirstName LastName ✓ · 2nd"
-
-    // 1. Try known name selectors
     for (const sel of [
+      ".artdeco-entity-lockup__title",
       "h2", "h3", "h4",
       'a[href*="/in/"]',
       'a[href*="/talent/profile/"]',
@@ -298,22 +333,122 @@ if (window.__lbrd_cleanup) {
       const el = card.querySelector(sel);
       if (el) {
         const raw = (el.childNodes[0]?.textContent || el.textContent).trim();
-        if (raw.length > 1 && raw.length < 60) return sanitiseName(raw);
+        if (raw.length > 1 && raw.length < 60) {
+          if (/unviewed\s+applicant/i.test(raw)) return "Unviewed_applicant";
+          const cleaned = sanitiseName(
+            raw.replace(/[·•].*$/, "").replace(/['’]s application$/i, "").trim()
+          );
+          if (cleaned) return cleaned;
+        }
       }
     }
 
-    // 2. Take the first line of text — usually the name
     const text = card.textContent.trim();
     const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     if (lines.length > 0) {
-      // First non-empty line is usually the name
       let name = lines[0];
-      // Clean connection badges like "· 2nd", "✓"
-      name = name.replace(/[·•].*$/, "").replace(/[✓✔☑️]/, "").trim();
+      name = name.replace(/[·•].*$/, "").trim();
+      if (/unviewed\s+applicant/i.test(name)) return "Unviewed_applicant";
       if (name.length > 1 && name.length < 60) return sanitiseName(name);
     }
 
     return "Unknown_Candidate";
+  }
+
+  /** Name from open detail panel: "Rahul Parashar's application" */
+  function extractNameFromDetailPanel() {
+    const header = document.querySelector(".hiring-applicant-header h1");
+    if (header) {
+      let raw = (header.childNodes[0]?.textContent || header.textContent || "").trim();
+      raw = raw
+        .replace(/['’]s application.*/i, "")
+        .replace(/\d+(st|nd|rd|th).*/i, "")
+        .replace(/degree connection/gi, "")
+        .split("\n")[0]
+        .trim();
+      const cleaned = sanitiseName(raw.replace(/[·•].*$/, "").trim());
+      if (cleaned && !isInvalidCardName(cleaned) && cleaned !== "Unviewed_applicant") {
+        return cleaned;
+      }
+    }
+    return null;
+  }
+
+  function isHiringManagerUI() {
+    return !!document.querySelector(
+      ".hiring-applicants__list-item, .hiring-applicant-header, .hiring-resume-viewer__pdf-download-link-icon, .ui-attachment__download-button"
+    );
+  }
+
+  /**
+   * Hiring Manager resume URL — NOT "See full profile".
+   * Real download controls:
+   *   .ui-attachment__download-button
+   *   .hiring-resume-viewer__pdf-download-link-icon → closest <a>
+   */
+  function getHiringResumeDownloadUrl() {
+    const attachment = document.querySelector("a.ui-attachment__download-button, .ui-attachment__download-button");
+    if (attachment && attachment.href && !attachment.href.includes("/in/")) {
+      log("  ✓ Hiring resume URL via ui-attachment__download-button");
+      return attachment.href;
+    }
+
+    const icon = document.querySelector(
+      ".hiring-resume-viewer__pdf-download-link-icon, svg.hiring-resume-viewer__pdf-download-link-icon"
+    );
+    if (icon) {
+      const link = icon.closest("a");
+      if (link && link.href && !link.href.includes("/in/")) {
+        log("  ✓ Hiring resume URL via resume-viewer download icon");
+        return link.href;
+      }
+    }
+
+    for (const a of document.querySelectorAll(
+      ".hiring-applicant-header-actions__dropdown-content a[href], .artdeco-dropdown__content a[href]"
+    )) {
+      const href = (a.href || "").toLowerCase();
+      const text = (a.textContent || "").toLowerCase();
+      if (
+        (text.includes("download") && text.includes("resume")) ||
+        href.includes("mediaauth") ||
+        href.includes(".pdf") ||
+        href.includes("dms/")
+      ) {
+        if (!href.includes("/in/")) {
+          log("  ✓ Hiring resume URL via More dropdown");
+          return a.href;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async function waitForHiringResumeUrl(maxWaitMs = 12000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      const url = getHiringResumeDownloadUrl();
+      if (url) return url;
+
+      const detail = document.querySelector(".hiring-applicant-detail, .scaffold-layout__detail, main");
+      if (detail) detail.scrollTop = (detail.scrollTop || 0) + 200;
+
+      await sleep(400 + Math.random() * 200);
+    }
+    return null;
+  }
+
+  async function tryOpenMoreMenuForResume() {
+    const moreBtn = Array.from(document.querySelectorAll(".hiring-applicant-header-actions button")).find((b) =>
+      /more/i.test(b.textContent || "")
+    );
+    if (!moreBtn) return false;
+
+    log("  Opening More… menu to look for resume…");
+    await humanClick(moreBtn);
+    await sleep(500 + Math.random() * 400);
+    return true;
   }
 
   // ══════════════════════════════════════════════════════════
@@ -323,21 +458,29 @@ if (window.__lbrd_cleanup) {
   async function selectApplicant(card) {
     const el = card.element;
 
-    // Find clickable target: prefer <a> links, then the element itself
+    // Prefer list-item anchor; avoid "See full profile" (/in/...) links
+    const anchors = [...el.querySelectorAll("a")].filter((a) => {
+      const href = a.getAttribute("href") || "";
+      return href && !href.includes("/in/") && !/see full profile/i.test(a.textContent || "");
+    });
+
     const clickTarget =
+      el.querySelector("a.hiring-applicants__list-item-link") ||
       el.querySelector('a[href*="applicationId"]') ||
       el.querySelector('a[href*="applicant"]') ||
-      el.querySelector('a[href*="hiring"]') ||
+      el.querySelector('a[href*="/hiring/"]') ||
+      anchors[0] ||
       el.querySelector("a") ||
       el;
 
     log(`  Clicking: <${clickTarget.tagName}> "${clickTarget.textContent.trim().substring(0, 40)}…"`);
 
-    // Human-like mouse movement + click
     await humanClick(clickTarget);
 
-    await sleep(600 + Math.random() * 900); // wait for detail panel to load
+    // Hiring Manager Ember UI needs more time for detail + resume viewer
+    await sleep(1200 + Math.random() * 1200);
   }
+
 
   // ══════════════════════════════════════════════════════════
   //  FIND "Resume" BUTTON
@@ -675,124 +818,168 @@ if (window.__lbrd_cleanup) {
     stopRequested = false;
     const total = applicantCards.length;
     let downloaded = 0, failed = 0;
+    const hiringUI = isHiringManagerUI();
 
     log(`Starting bulk download for ${total} applicant(s)…`);
+    log(`  Detected UI: ${hiringUI ? "Hiring Manager (Jobs applicants)" : "Talent Hub / Recruiter-style"}`);
 
-    // Notify background so popup can reconnect
     chrome.runtime.sendMessage({ type: "DOWNLOAD_STARTED", total }).catch(() => {});
 
     for (let i = 0; i < applicantCards.length; i++) {
-      if (stopRequested) { notify("DONE", { downloaded, total, failed }); chrome.runtime.sendMessage({ type: "DOWNLOAD_STOPPED" }).catch(() => {}); return; }
+      if (stopRequested) {
+        notify("DONE", { downloaded, total, failed });
+        chrome.runtime.sendMessage({ type: "DOWNLOAD_STOPPED" }).catch(() => {});
+        return;
+      }
 
       const card = applicantCards[i];
-      const name = card.name;
+      let name = card.name;
       log(`\n━━━ [${i + 1}/${total}] ${name} ━━━`);
 
       try {
         log("  Step 1: Selecting applicant…");
         await selectApplicant(card);
 
-        log("  Step 2: Looking for Resume button…");
-        const resumeBtn = await findResumeButton(10000);
-        if (!resumeBtn) {
-          log(`  ✗ No Resume button for ${name}`); failed++;
-          notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(0, 3);
-          continue;
+        // Prefer real name from detail header ("Rahul Parashar's application")
+        const detailName = extractNameFromDetailPanel();
+        if (detailName) {
+          name = detailName;
+          card.name = detailName;
+          log(`  Name from detail panel: ${name}`);
         }
 
-        log("  Step 2: Clicking Resume…");
-        await humanClick(resumeBtn);
-
-        log("  Step 3: Waiting for popup…");
-        await sleep(600 + Math.random() * 600);
-        const downloadBtn = await findDownloadButton(10000);
-        if (!downloadBtn) {
-          log(`  ✗ No Download button for ${name}`); failed++;
-          await closePreviewPopup();
-          notify("PROGRESS", { downloaded, total, failed });
-          if (i < applicantCards.length - 1) await randomDelay(0, 3);
-          continue;
-        }
-
-        // Pause before interacting with download button
-        await rsleep(200);
-
-        // ── Always tell background to watch for new PDF tabs as LAST-RESORT safety net ──
-        chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
-
-        // ── Try to extract the PDF URL directly from the preview ──
-        let pdfUrl = extractPdfUrl();
         let dlSuccess = false;
 
-        if (pdfUrl) {
-          // We already have the URL — fetch as blob and download
-          log(`  Step 3: Direct PDF URL found, fetching blob…`);
-          dlSuccess = await downloadViaFetch(pdfUrl, name);
-          if (!dlSuccess) {
-            // Fallback: send to background
-            log(`  Step 3: Blob failed, sending URL to background…`);
-            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+        // ── Path A: Hiring Manager — resume PDF link in the detail pane ──
+        if (hiringUI || document.querySelector(".hiring-applicant-header")) {
+          log("  Step 2: Looking for Hiring resume download link…");
+          let pdfUrl = await waitForHiringResumeUrl(8000);
+
+          if (!pdfUrl) {
+            await tryOpenMoreMenuForResume();
+            pdfUrl = await waitForHiringResumeUrl(4000);
           }
-        } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
-          // It's a link — fetch as blob
-          log(`  Step 3: Download link href found, fetching blob…`);
-          dlSuccess = await downloadViaFetch(downloadBtn.href, name);
-          if (!dlSuccess) {
-            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
+
+          // Also check iframe / embed PDF
+          if (!pdfUrl) {
+            pdfUrl = extractPdfUrl();
+            if (pdfUrl) log("  ✓ PDF URL from preview iframe/embed");
           }
-        } else {
-          // Must click the button — intercept window.open in main world
-          // The injected script will ALSO fetch+download the PDF as a blob
-          log("  Step 3: Clicking Download (with main-world interception + fetch)…");
 
-          startWindowOpenIntercept(name);
-
-          // Human-like click on the download button
-          await humanClick(downloadBtn);
-
-          await sleep(1500 + Math.random() * 1500); // wait for fetch+download in main world
-
-          const result = checkInterceptResult();
-          if (result.downloadedInMainWorld) {
-            log("  ✓ Downloaded via main-world fetch!");
-            dlSuccess = true;
-          } else if (result.url) {
-            // Main world fetch failed but we got the URL — try from content script
-            log("  Step 3: Trying content-script fetch with captured URL…");
-            dlSuccess = await downloadViaFetch(result.url, name);
+          if (pdfUrl) {
+            log("  Step 3: Fetching resume blob…");
+            chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+            dlSuccess = await downloadViaFetch(pdfUrl, name);
             if (!dlSuccess) {
-              // Last resort: send URL to background
-              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: result.url, candidateName: name });
+              log("  Blob failed — sending URL to background downloads…");
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+              dlSuccess = true; // queued; count as attempted success for UX
             }
           } else {
-            // Nothing intercepted — check for PDF URL that appeared after click
-            const postClickUrl = extractPdfUrl();
-            if (postClickUrl) {
-              log(`  Step 3: Found PDF URL after click, fetching…`);
-              dlSuccess = await downloadViaFetch(postClickUrl, name);
+            log(`  ✗ No resume download link for ${name} (applicant may not have attached a resume)`);
+            failed++;
+            notify("DOWNLOAD_ERROR", { candidateName: name, error: "No resume download link found" });
+            notify("PROGRESS", { downloaded, total, failed });
+            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            continue;
+          }
+        } else {
+          // ── Path B: Talent Hub — Resume button → Download button ──
+          log("  Step 2: Looking for Resume button…");
+          const resumeBtn = await findResumeButton(10000);
+          if (!resumeBtn) {
+            log(`  ✗ No Resume button for ${name}`);
+            failed++;
+            notify("PROGRESS", { downloaded, total, failed });
+            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            continue;
+          }
+
+          log("  Step 2: Clicking Resume…");
+          await humanClick(resumeBtn);
+
+          log("  Step 3: Waiting for popup…");
+          await sleep(600 + Math.random() * 600);
+          const downloadBtn = await findDownloadButton(10000);
+          if (!downloadBtn) {
+            log(`  ✗ No Download button for ${name}`);
+            failed++;
+            await closePreviewPopup();
+            notify("PROGRESS", { downloaded, total, failed });
+            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            continue;
+          }
+
+          await rsleep(200);
+          chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+
+          let pdfUrl = extractPdfUrl();
+
+          if (pdfUrl) {
+            log("  Step 3: Direct PDF URL found, fetching blob…");
+            dlSuccess = await downloadViaFetch(pdfUrl, name);
+            if (!dlSuccess) {
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
+              dlSuccess = true;
+            }
+          } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
+            log("  Step 3: Download link href found, fetching blob…");
+            dlSuccess = await downloadViaFetch(downloadBtn.href, name);
+            if (!dlSuccess) {
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
+              dlSuccess = true;
+            }
+          } else {
+            log("  Step 3: Clicking Download (with main-world interception + fetch)…");
+            startWindowOpenIntercept(name);
+            await humanClick(downloadBtn);
+            await sleep(1500 + Math.random() * 1500);
+
+            const result = checkInterceptResult();
+            if (result.downloadedInMainWorld) {
+              dlSuccess = true;
+            } else if (result.url) {
+              dlSuccess = await downloadViaFetch(result.url, name);
               if (!dlSuccess) {
-                chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
+                chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: result.url, candidateName: name });
+                dlSuccess = true;
               }
             } else {
-              log("  Step 3: Relying on background tab watcher (last resort)");
+              const postClickUrl = extractPdfUrl();
+              if (postClickUrl) {
+                dlSuccess = await downloadViaFetch(postClickUrl, name);
+                if (!dlSuccess) {
+                  chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
+                  dlSuccess = true;
+                }
+              } else {
+                log("  Step 3: Relying on background tab watcher (last resort)");
+                dlSuccess = true; // may still be caught by tab watcher
+              }
             }
           }
+
+          log("  Step 4: Closing popup…");
+          await rsleep(800);
+          await closePreviewPopup();
+          await rsleep(500);
         }
 
-        downloaded++;
-        log(`  ✓ Downloaded: ${name}`);
-        notify("PROGRESS", { downloaded, total, failed, candidateName: name });
-
-        log("  Step 4: Closing popup…");
-        await rsleep(800);
-        await closePreviewPopup();
-        await rsleep(500);
+        if (dlSuccess) {
+          downloaded++;
+          log(`  ✓ Downloaded: ${name}`);
+          notify("PROGRESS", { downloaded, total, failed, candidateName: name });
+        } else {
+          failed++;
+          notify("PROGRESS", { downloaded, total, failed });
+        }
       } catch (err) {
-        log(`  ✗ Error: ${err.message}`); failed++;
+        log(`  ✗ Error: ${err.message}`);
+        failed++;
         notify("DOWNLOAD_ERROR", { candidateName: name, error: err.message });
         notify("PROGRESS", { downloaded, total, failed });
-        await closePreviewPopup(); await rsleep(300);
+        await closePreviewPopup();
+        await rsleep(300);
       }
 
       if (i < applicantCards.length - 1 && !stopRequested) {
@@ -814,31 +1001,53 @@ if (window.__lbrd_cleanup) {
   function debugScan() {
     const info = { url: window.location.href };
 
-    // Run scan
     const count = scanApplicantCards();
     info.applicantCardsFound = count;
     info.applicantNames = applicantCards.map((c) => c.name);
 
-    // Resume / Download buttons
-    info.resumeButtonVisible = !!document.querySelector('button[data-view-name="hiring-applicant-view-resume"]');
-    info.documentIconVisible = !!document.querySelector('svg[id="document-small"]');
-    info.downloadIconVisible = !!document.querySelector('svg[id="download-small"]');
+    info.totalButtons = document.querySelectorAll("button").length;
+    info.totalLinks = document.querySelectorAll("a[href]").length;
+    info.hiringListItems = document.querySelectorAll(".hiring-applicants__list-item").length;
+    info.hiringUI = isHiringManagerUI();
 
-    // All data-view-name elements
+    const hiringUrl = getHiringResumeDownloadUrl();
+    info.hiringResumeUrlFound = !!hiringUrl;
+    info.hiringResumeUrlPreview = hiringUrl ? hiringUrl.substring(0, 100) : null;
+    info.uiAttachmentDownload = !!document.querySelector(".ui-attachment__download-button");
+    info.resumeViewerDownloadIcon = !!document.querySelector(".hiring-resume-viewer__pdf-download-link-icon");
+
+    const resumeBtn = document.querySelector('button[data-view-name="hiring-applicant-view-resume"]');
+    info.resumeButtonVisible = !!resumeBtn || info.uiAttachmentDownload || info.resumeViewerDownloadIcon;
+    info.resumeButtonText = resumeBtn
+      ? resumeBtn.textContent.trim().substring(0, 40)
+      : (info.uiAttachmentDownload
+          ? "ui-attachment__download-button"
+          : (info.resumeViewerDownloadIcon ? "hiring-resume-viewer download icon" : ""));
+
+    info.documentIconVisible = !!document.querySelector('svg[id="document-small"]');
+    info.downloadIconVisible =
+      !!document.querySelector('svg[id="download-small"]') ||
+      info.uiAttachmentDownload ||
+      info.resumeViewerDownloadIcon;
+
+    info.detailPanelName = extractNameFromDetailPanel();
+
+    info.dataViewButtons = [];
     info.dataViewElements = [];
     document.querySelectorAll("[data-view-name]").forEach((el) => {
-      info.dataViewElements.push({
+      const entry = {
         tag: el.tagName,
         dataViewName: el.getAttribute("data-view-name"),
         text: el.textContent.trim().substring(0, 50),
-      });
+      };
+      info.dataViewElements.push(entry);
+      if (el.tagName === "BUTTON") info.dataViewButtons.push(entry);
     });
 
-    // Buttons with resume/download
     info.relevantButtons = [];
     document.querySelectorAll("button").forEach((btn) => {
       const text = btn.textContent.trim().toLowerCase();
-      if (text.includes("resume") || text.includes("download")) {
+      if (text.includes("resume") || text.includes("download") || text.includes("more")) {
         info.relevantButtons.push({
           text: btn.textContent.trim().substring(0, 60),
           dataViewName: btn.getAttribute("data-view-name") || "",
@@ -846,53 +1055,10 @@ if (window.__lbrd_cleanup) {
       }
     });
 
-    // ── DOM DUMP — show the actual structure of the left panel ──
-    // Find elements that contain "Shortlist" or "Applicants"
-    info.domHints = [];
-    const body = document.body;
-    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-    let textNode;
-    while ((textNode = walker.nextNode())) {
-      const t = textNode.textContent.trim();
-      if (t === "Shortlist" || t === "Applicants" || t === "All applicants") {
-        let parent = textNode.parentElement;
-        // Walk up a few levels to find the container
-        for (let i = 0; i < 6 && parent; i++) {
-          parent = parent.parentElement;
-        }
-        if (parent) {
-          info.domHints.push({
-            heading: t,
-            containerTag: parent.tagName,
-            containerChildren: parent.children.length,
-            firstChildTag: parent.children[0]?.tagName || "none",
-            firstChildText: parent.children[0]?.textContent?.trim()?.substring(0, 100) || "none",
-            firstChildDataView: parent.children[0]?.getAttribute?.("data-view-name") || "",
-            firstChildComponentKey: parent.children[0]?.getAttribute?.("componentkey") || "",
-            containerHTML: parent.outerHTML.substring(0, 300),
-          });
-        }
-        break;
-      }
-    }
-
-    // ── List all componentkey elements with their text ──
-    info.componentKeyElements = [];
-    document.querySelectorAll("[componentkey]").forEach((el) => {
-      const text = el.textContent.trim();
-      if (text.length > 15 && text.length < 500) {
-        info.componentKeyElements.push({
-          tag: el.tagName,
-          key: el.getAttribute("componentkey")?.substring(0, 20) || "",
-          textPreview: text.substring(0, 80),
-          childCount: el.children.length,
-        });
-      }
-    });
-
-    // ── Links with applicationId ──
     info.applicationLinks = [];
-    document.querySelectorAll('a[href*="applicationId"], a[href*="applicant"]').forEach((a) => {
+    document.querySelectorAll(
+      '.hiring-applicants__list-item a, a[href*="applicationId"], a[href*="applicant"]'
+    ).forEach((a) => {
       info.applicationLinks.push({
         href: a.href.substring(0, 120),
         text: a.textContent.trim().substring(0, 60),
@@ -922,5 +1088,5 @@ if (window.__lbrd_cleanup) {
   chrome.runtime.onMessage.addListener(messageHandler);
   window.__lbrd_cleanup = () => chrome.runtime.onMessage.removeListener(messageHandler);
 
-  console.log("[LBRD] Content script v5 loaded.");
+  console.log("[LBRD] Content script v6 loaded (Hiring Manager + Talent Hub).");
 })();
