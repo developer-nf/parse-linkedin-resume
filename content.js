@@ -357,8 +357,15 @@ if (window.__lbrd_cleanup) {
 
   /** Name from open detail panel: "Rahul Parashar's application" */
   function extractNameFromDetailPanel() {
-    const header = document.querySelector(".hiring-applicant-header h1");
-    if (header) {
+    const selectors = [
+      ".hiring-applicant-header h1",
+      ".hiring-applicant-header .artdeco-entity-lockup__title",
+      "#hiring-detail-root h1",
+      ".hiring-applicants__right-column h1",
+    ];
+    for (const sel of selectors) {
+      const header = document.querySelector(sel);
+      if (!header) continue;
       let raw = (header.childNodes[0]?.textContent || header.textContent || "").trim();
       raw = raw
         .replace(/['’]s application.*/i, "")
@@ -425,18 +432,70 @@ if (window.__lbrd_cleanup) {
     return null;
   }
 
+  /** LinkedIn blocks the resume download control until its virus scan finishes. */
+  function isVirusScanBlocking() {
+    const section = document.querySelector(".hiring-resume-viewer__virus-scan-section");
+    if (section) {
+      const style = window.getComputedStyle(section);
+      if (style.display !== "none" && style.visibility !== "hidden") return true;
+    }
+    const viewer = document.querySelector(".hiring-resume-viewer, .artdeco-card");
+    const text = (viewer?.textContent || document.body?.innerText || "");
+    return /Scanning resume for viruses/i.test(text);
+  }
+
   async function waitForHiringResumeUrl(maxWaitMs = 12000) {
     const start = Date.now();
+    let loggedVirus = false;
     while (Date.now() - start < maxWaitMs) {
       const url = getHiringResumeDownloadUrl();
       if (url) return url;
 
-      const detail = document.querySelector(".hiring-applicant-detail, .scaffold-layout__detail, main");
+      if (isVirusScanBlocking()) {
+        if (!loggedVirus) {
+          log("  ⏳ LinkedIn virus scan in progress — waiting for download control…");
+          loggedVirus = true;
+        }
+      }
+
+      const detail = document.querySelector(
+        ".hiring-applicant-detail, #hiring-detail-root, .hiring-applicants__right-column, .scaffold-layout__detail, main"
+      );
       if (detail) detail.scrollTop = (detail.scrollTop || 0) + 200;
 
       await sleep(400 + Math.random() * 200);
     }
     return null;
+  }
+
+  /**
+   * Wait out LinkedIn's virus-scan interstitial, then return the resume URL.
+   * If scan text persists, re-select the applicant once to reload the detail panel
+   * (LinkedIn's own copy says "Please refresh").
+   */
+  async function waitForResumeReady(card, maxWaitMs = 45000) {
+    let url = await waitForHiringResumeUrl(Math.min(15000, maxWaitMs));
+    if (url) return url;
+
+    if (isVirusScanBlocking() || !getHiringResumeDownloadUrl()) {
+      log("  Virus scan / no download yet — re-selecting applicant to refresh panel…");
+      await selectApplicant(card);
+      await sleep(1500 + Math.random() * 1000);
+      url = await waitForHiringResumeUrl(Math.max(20000, maxWaitMs - 15000));
+      if (url) return url;
+    }
+
+    if (!url) {
+      await tryOpenMoreMenuForResume();
+      url = await waitForHiringResumeUrl(5000);
+    }
+
+    if (!url) {
+      url = extractPdfUrl();
+      if (url) log("  ✓ PDF URL from preview iframe/embed");
+    }
+
+    return url;
   }
 
   async function tryOpenMoreMenuForResume() {
@@ -636,14 +695,92 @@ if (window.__lbrd_cleanup) {
     return `${safe}_Resume_${ts}.pdf`;
   }
 
-  async function downloadViaFetch(url, candidateName) {
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("FileReader failed"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function looksLikePdf(bytes) {
+    if (!bytes || bytes.length < 4) return false;
+    // %PDF
+    return bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+  }
+
+  function setCurrentFilenameInPage(candidateName) {
     const filename = buildDownloadFilename(candidateName);
+    const script = document.createElement("script");
+    script.textContent = `window.__lbrd_currentFilename = ${JSON.stringify(filename)};`;
+    document.documentElement.appendChild(script);
+    script.remove();
+    // Tell background so chrome.downloads.onDeterminingFilename can rename
+    // LinkedIn's generic "download" files to the applicant name.
+    chrome.runtime.sendMessage({
+      type: "SET_INTENDED_FILENAME",
+      candidateName,
+      filename,
+    }).catch(() => {});
+    return filename;
+  }
+
+  function clearPdfTabWatch() {
+    chrome.runtime.sendMessage({ type: "CLEAR_PDF_TAB" }).catch(() => {});
+  }
+
+  /**
+   * Fetch the resume with session cookies, then save via background chrome.downloads
+   * so the filename is always CandidateName_Resume_YYYY-MM-DD.pdf under LinkedIn_Resumes/.
+   * Falls back to an in-page <a download> if messaging fails.
+   */
+  async function downloadViaFetch(url, candidateName) {
+    const filename = setCurrentFilenameInPage(candidateName);
     log(`  Fetching PDF blob from: ${url.substring(0, 80)}…`);
     try {
       const resp = await fetch(url, { credentials: "include" });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const blob = await resp.blob();
-      const blobUrl = URL.createObjectURL(blob);
+      const buf = await resp.arrayBuffer();
+      const header = new Uint8Array(buf.slice(0, 8));
+      if (!looksLikePdf(header)) {
+        // LinkedIn sometimes returns an HTML interstitial / error instead of the PDF
+        const asText = new TextDecoder().decode(buf.slice(0, 500));
+        if (/virus|scanning|sign.?in|login/i.test(asText)) {
+          throw new Error("Got HTML interstitial instead of PDF (virus scan or auth)");
+        }
+        log("  ⚠ Response does not start with %PDF — downloading anyway");
+      }
+
+      const pdfBlob = new Blob([buf], { type: "application/pdf" });
+
+      // Prefer chrome.downloads so name + LinkedIn_Resumes/ folder are guaranteed
+      try {
+        const dataUrl = await blobToDataUrl(pdfBlob);
+        const queued = await new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            { type: "DOWNLOAD_RESUME", url: dataUrl, candidateName, filename },
+            (resp) => {
+              if (chrome.runtime.lastError) {
+                log(`  ⚠ Background msg error: ${chrome.runtime.lastError.message}`);
+                resolve(false);
+                return;
+              }
+              resolve(!!(resp && (resp.queued || resp.ok)));
+            }
+          );
+        });
+        if (queued) {
+          clearPdfTabWatch();
+          log(`  ✓ Queued named download: ${filename}`);
+          return true;
+        }
+      } catch (msgErr) {
+        log(`  ⚠ Background download path failed: ${msgErr.message}`);
+      }
+
+      // Fallback: in-page blob download (still uses applicant name)
+      const blobUrl = URL.createObjectURL(pdfBlob);
       const a = document.createElement("a");
       a.href = blobUrl;
       a.download = filename;
@@ -652,6 +789,7 @@ if (window.__lbrd_cleanup) {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      clearPdfTabWatch();
       log(`  ✓ Blob download triggered: ${filename}`);
       return true;
     } catch (err) {
@@ -697,12 +835,13 @@ if (window.__lbrd_cleanup) {
           var s = String(url || "");
           window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
           fetch(s, { credentials: "include" })
-            .then(function(r) { return r.blob(); })
-            .then(function(blob) {
+            .then(function(r) { return r.arrayBuffer(); })
+            .then(function(buf) {
+              var blob = new Blob([buf], { type: "application/pdf" });
               var u = URL.createObjectURL(blob);
               var a = document.createElement("a");
               a.href = u;
-              a.download = window.__lbrd_currentFilename || "Resume.pdf";
+              a.download = window.__lbrd_currentFilename || "Unknown_Candidate_Resume.pdf";
               document.body.appendChild(a);
               a.click();
               a.remove();
@@ -743,6 +882,34 @@ if (window.__lbrd_cleanup) {
     return result;
   }
 
+  /** Poll background until the PDF-tab watcher confirms a download (or times out). */
+  async function waitForPdfTabDownload(maxWaitMs = 10000) {
+    const start = Date.now();
+    // Brief grace so EXPECT_PDF_TAB / DOWNLOAD_RESUME can register
+    await sleep(300);
+    while (Date.now() - start < maxWaitMs) {
+      const status = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "PDF_TAB_STATUS" }, (resp) => {
+          if (chrome.runtime.lastError) resolve({});
+          else resolve(resp || {});
+        });
+      });
+      if (status.lastSavedCandidate) {
+        log(`  ✓ Confirmed save: ${status.lastSavedCandidate}`);
+        return true;
+      }
+      if (!status.watching && status.lastError) {
+        log(`  ⚠ Tab watcher: ${status.lastError}`);
+        return false;
+      }
+      // If watch already cleared with no save and no error, keep polling briefly
+      // (DOWNLOAD_RESUME may still be finishing)
+      await sleep(400);
+    }
+    clearPdfTabWatch();
+    return false;
+  }
+
   // ══════════════════════════════════════════════════════════
   //  INTERCEPT <a target="_blank"> clicks (another way LinkedIn opens PDFs)
   // ══════════════════════════════════════════════════════════
@@ -751,6 +918,8 @@ if (window.__lbrd_cleanup) {
     const script = document.createElement("script");
     script.textContent = `
       (function() {
+        if (window.__lbrd_linkInterceptInstalled) return;
+        window.__lbrd_linkInterceptInstalled = true;
         document.addEventListener("click", function(e) {
           var a = e.target.closest ? e.target.closest("a") : null;
           if (a && a.href && (a.target === "_blank" || a.getAttribute("target") === "_blank")) {
@@ -760,21 +929,24 @@ if (window.__lbrd_cleanup) {
               e.preventDefault();
               e.stopPropagation();
               window.postMessage({ __lbrd_intercepted: true, url: a.href }, "*");
-              // Also fetch and download
+              var fname = window.__lbrd_currentFilename || "Unknown_Candidate_Resume.pdf";
               fetch(a.href, { credentials: "include" })
-                .then(function(r) { return r.blob(); })
-                .then(function(blob) {
+                .then(function(r) { return r.arrayBuffer(); })
+                .then(function(buf) {
+                  var blob = new Blob([buf], { type: "application/pdf" });
                   var u = URL.createObjectURL(blob);
                   var el = document.createElement("a");
                   el.href = u;
-                  el.download = "Resume.pdf";
+                  el.download = fname;
                   document.body.appendChild(el);
                   el.click();
                   el.remove();
                   setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
-                  window.postMessage({ __lbrd_download_done: true }, "*");
+                  window.postMessage({ __lbrd_download_done: true, filename: fname }, "*");
                 })
-                .catch(function() {});
+                .catch(function(err) {
+                  window.postMessage({ __lbrd_download_failed: true, error: String(err && err.message || err) }, "*");
+                });
             }
           }
         }, true);
@@ -835,6 +1007,8 @@ if (window.__lbrd_cleanup) {
       const card = applicantCards[i];
       let name = card.name;
       log(`\n━━━ [${i + 1}/${total}] ${name} ━━━`);
+      clearPdfTabWatch();
+      setCurrentFilenameInPage(name);
 
       try {
         log("  Step 1: Selecting applicant…");
@@ -847,38 +1021,42 @@ if (window.__lbrd_cleanup) {
           card.name = detailName;
           log(`  Name from detail panel: ${name}`);
         }
+        setCurrentFilenameInPage(name);
 
         let dlSuccess = false;
 
         // ── Path A: Hiring Manager — resume PDF link in the detail pane ──
         if (hiringUI || document.querySelector(".hiring-applicant-header")) {
-          log("  Step 2: Looking for Hiring resume download link…");
-          let pdfUrl = await waitForHiringResumeUrl(8000);
-
-          if (!pdfUrl) {
-            await tryOpenMoreMenuForResume();
-            pdfUrl = await waitForHiringResumeUrl(4000);
-          }
-
-          // Also check iframe / embed PDF
-          if (!pdfUrl) {
-            pdfUrl = extractPdfUrl();
-            if (pdfUrl) log("  ✓ PDF URL from preview iframe/embed");
-          }
+          log("  Step 2: Looking for Hiring resume download link (incl. virus-scan wait)…");
+          setCurrentFilenameInPage(name);
+          const pdfUrl = await waitForResumeReady(card, 45000);
 
           if (pdfUrl) {
             log("  Step 3: Fetching resume blob…");
-            chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
             dlSuccess = await downloadViaFetch(pdfUrl, name);
             if (!dlSuccess) {
-              log("  Blob failed — sending URL to background downloads…");
-              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
-              dlSuccess = true; // queued; count as attempted success for UX
+              log("  Blob failed — trying background download + PDF tab watcher…");
+              chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+              dlSuccess = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                  { type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name },
+                  (resp) => resolve(!!(resp && resp.ok))
+                );
+              });
+              if (!dlSuccess) {
+                dlSuccess = await waitForPdfTabDownload(12000);
+              } else {
+                clearPdfTabWatch();
+              }
             }
           } else {
-            log(`  ✗ No resume download link for ${name} (applicant may not have attached a resume)`);
+            const stillScanning = isVirusScanBlocking();
+            const errMsg = stillScanning
+              ? "LinkedIn virus scan never finished — no download control appeared"
+              : "No resume download link found";
+            log(`  ✗ ${errMsg} for ${name}`);
             failed++;
-            notify("DOWNLOAD_ERROR", { candidateName: name, error: "No resume download link found" });
+            notify("DOWNLOAD_ERROR", { candidateName: name, error: errMsg });
             notify("PROGRESS", { downloaded, total, failed });
             if (i < applicantCards.length - 1) await randomDelay(0, 3);
             continue;
@@ -911,7 +1089,7 @@ if (window.__lbrd_cleanup) {
           }
 
           await rsleep(200);
-          chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+          setCurrentFilenameInPage(name);
 
           let pdfUrl = extractPdfUrl();
 
@@ -919,18 +1097,33 @@ if (window.__lbrd_cleanup) {
             log("  Step 3: Direct PDF URL found, fetching blob…");
             dlSuccess = await downloadViaFetch(pdfUrl, name);
             if (!dlSuccess) {
-              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
-              dlSuccess = true;
+              chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+              dlSuccess = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                  { type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name },
+                  (resp) => resolve(!!(resp && resp.ok))
+                );
+              });
+              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+              else clearPdfTabWatch();
             }
           } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
             log("  Step 3: Download link href found, fetching blob…");
             dlSuccess = await downloadViaFetch(downloadBtn.href, name);
             if (!dlSuccess) {
-              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
-              dlSuccess = true;
+              chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+              dlSuccess = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                  { type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name },
+                  (resp) => resolve(!!(resp && resp.ok))
+                );
+              });
+              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+              else clearPdfTabWatch();
             }
           } else {
             log("  Step 3: Clicking Download (with main-world interception + fetch)…");
+            chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
             startWindowOpenIntercept(name);
             await humanClick(downloadBtn);
             await sleep(1500 + Math.random() * 1500);
@@ -938,23 +1131,39 @@ if (window.__lbrd_cleanup) {
             const result = checkInterceptResult();
             if (result.downloadedInMainWorld) {
               dlSuccess = true;
+              clearPdfTabWatch();
             } else if (result.url) {
               dlSuccess = await downloadViaFetch(result.url, name);
               if (!dlSuccess) {
-                chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: result.url, candidateName: name });
-                dlSuccess = true;
+                dlSuccess = await new Promise((resolve) => {
+                  chrome.runtime.sendMessage(
+                    { type: "DOWNLOAD_RESUME", url: result.url, candidateName: name },
+                    (resp) => resolve(!!(resp && resp.ok))
+                  );
+                });
+                if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+                else clearPdfTabWatch();
               }
             } else {
               const postClickUrl = extractPdfUrl();
               if (postClickUrl) {
                 dlSuccess = await downloadViaFetch(postClickUrl, name);
                 if (!dlSuccess) {
-                  chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
-                  dlSuccess = true;
+                  dlSuccess = await new Promise((resolve) => {
+                    chrome.runtime.sendMessage(
+                      { type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name },
+                      (resp) => resolve(!!(resp && resp.ok))
+                    );
+                  });
+                  if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+                  else clearPdfTabWatch();
                 }
               } else {
-                log("  Step 3: Relying on background tab watcher (last resort)");
-                dlSuccess = true; // may still be caught by tab watcher
+                log("  Step 3: Waiting for background PDF tab watcher…");
+                dlSuccess = await waitForPdfTabDownload(8000);
+                if (!dlSuccess) {
+                  log("  ✗ No PDF URL and tab watcher did not confirm a download");
+                }
               }
             }
           }
