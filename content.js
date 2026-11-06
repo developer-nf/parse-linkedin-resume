@@ -518,63 +518,57 @@ if (window.__lbrd_cleanup) {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  INTERCEPT window.open IN THE MAIN WORLD via <script> injection
-  //  Content scripts run in an isolated world — they CANNOT override
-  //  the page's window.open. We must inject into the page itself.
-  //  The injected code ALSO fetches the PDF as a blob and triggers
-  //  a download directly (so the one-time URL isn't wasted).
+  //  MAIN-WORLD INTERCEPT via chrome.scripting.executeScript
+  //  Content scripts are isolated — they cannot override the page's
+  //  window.open. Background injects a function into world: "MAIN"
+  //  (CSP-safe; no inline <script> tags / no extra file needed).
   // ══════════════════════════════════════════════════════════
 
   let interceptedUrl = null;
   let mainWorldDownloaded = false;
   let interceptListenerActive = false;
+  let linkInterceptRequested = false;
 
-  function startWindowOpenIntercept(candidateName) {
+  function ensureInterceptListener() {
+    if (interceptListenerActive) return;
+    window.addEventListener("message", onInterceptMessage);
+    interceptListenerActive = true;
+  }
+
+  function injectPageBridge(filename, installLinkIntercept = false) {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        {
+          type: "INJECT_PAGE_BRIDGE",
+          filename,
+          installLinkIntercept,
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            log(`  ⚠ MAIN-world inject failed: ${chrome.runtime.lastError.message}`);
+            resolve(false);
+            return;
+          }
+          resolve(!!(resp && resp.ok));
+        }
+      );
+    });
+  }
+
+  function setPageFilename(filename) {
+    // Re-inject with updated filename (also refreshes window.open patch)
+    injectPageBridge(filename, false);
+  }
+
+  async function startWindowOpenIntercept(candidateName) {
     interceptedUrl = null;
     mainWorldDownloaded = false;
-
-    // Listen for messages from the injected page script (only add once)
-    if (!interceptListenerActive) {
-      window.addEventListener("message", onInterceptMessage);
-      interceptListenerActive = true;
-    }
+    ensureInterceptListener();
 
     const filename = buildDownloadFilename(candidateName);
-
-    // Inject a <script> into the page's main world
-    // Re-inject every time to update the filename for the current candidate
-    const script = document.createElement("script");
-    script.textContent = `
-      (function() {
-        if (!window.__lbrd_origOpen) {
-          window.__lbrd_origOpen = window.open;
-        }
-        window.__lbrd_currentFilename = ${JSON.stringify(filename)};
-        window.open = function(url) {
-          var s = String(url || "");
-          window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
-          fetch(s, { credentials: "include" })
-            .then(function(r) { return r.blob(); })
-            .then(function(blob) {
-              var u = URL.createObjectURL(blob);
-              var a = document.createElement("a");
-              a.href = u;
-              a.download = window.__lbrd_currentFilename || "Resume.pdf";
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
-              setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
-              window.postMessage({ __lbrd_download_done: true }, "*");
-            })
-            .catch(function(err) {
-              window.postMessage({ __lbrd_download_failed: true, error: err.message }, "*");
-            });
-          return null;
-        };
-      })();
-    `;
-    document.documentElement.appendChild(script);
-    script.remove();
+    const wantLinkIntercept = !linkInterceptRequested;
+    const ok = await injectPageBridge(filename, wantLinkIntercept);
+    if (ok && wantLinkIntercept) linkInterceptRequested = true;
   }
 
   function onInterceptMessage(event) {
@@ -600,49 +594,11 @@ if (window.__lbrd_cleanup) {
     return result;
   }
 
-  // ══════════════════════════════════════════════════════════
-  //  INTERCEPT <a target="_blank"> clicks (another way LinkedIn opens PDFs)
-  // ══════════════════════════════════════════════════════════
-
-  function interceptLinkClicks() {
-    const script = document.createElement("script");
-    script.textContent = `
-      (function() {
-        document.addEventListener("click", function(e) {
-          var a = e.target.closest ? e.target.closest("a") : null;
-          if (a && a.href && (a.target === "_blank" || a.getAttribute("target") === "_blank")) {
-            var href = a.href.toLowerCase();
-            if (href.includes(".pdf") || href.includes("mediaauth") || href.includes("resume")
-                || href.includes("dms/") || href.includes("media.licdn")) {
-              e.preventDefault();
-              e.stopPropagation();
-              window.postMessage({ __lbrd_intercepted: true, url: a.href }, "*");
-              // Also fetch and download
-              fetch(a.href, { credentials: "include" })
-                .then(function(r) { return r.blob(); })
-                .then(function(blob) {
-                  var u = URL.createObjectURL(blob);
-                  var el = document.createElement("a");
-                  el.href = u;
-                  el.download = "Resume.pdf";
-                  document.body.appendChild(el);
-                  el.click();
-                  el.remove();
-                  setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
-                  window.postMessage({ __lbrd_download_done: true }, "*");
-                })
-                .catch(function() {});
-            }
-          }
-        }, true);
-      })();
-    `;
-    document.documentElement.appendChild(script);
-    script.remove();
-  }
-
-  // Inject link click interceptor on load
-  interceptLinkClicks();
+  ensureInterceptListener();
+  // Install link-click interceptor once on load
+  injectPageBridge("Unknown_Candidate_Resume.pdf", true).then((ok) => {
+    if (ok) linkInterceptRequested = true;
+  });
 
   // ══════════════════════════════════════════════════════════
   //  CLOSE popup
@@ -687,6 +643,7 @@ if (window.__lbrd_cleanup) {
       const card = applicantCards[i];
       const name = card.name;
       log(`\n━━━ [${i + 1}/${total}] ${name} ━━━`);
+      setPageFilename(buildDownloadFilename(name));
 
       try {
         log("  Step 1: Selecting applicant…");
@@ -746,7 +703,7 @@ if (window.__lbrd_cleanup) {
           // The injected script will ALSO fetch+download the PDF as a blob
           log("  Step 3: Clicking Download (with main-world interception + fetch)…");
 
-          startWindowOpenIntercept(name);
+          await startWindowOpenIntercept(name);
 
           // Human-like click on the download button
           await humanClick(downloadBtn);
