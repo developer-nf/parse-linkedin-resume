@@ -62,25 +62,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // ── Inject MAIN-world interceptors (CSP-safe; no inline <script>) ──
-  if (msg.type === "INJECT_PAGE_BRIDGE") {
-    const tabId = sender.tab && sender.tab.id;
-    if (!tabId) {
-      sendResponse({ ok: false, error: "No tab id" });
-      return true;
-    }
-    chrome.scripting
-      .executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: installPageBridge,
-        args: [msg.filename || "Unknown_Candidate_Resume.pdf", !!msg.installLinkIntercept],
-      })
-      .then(() => sendResponse({ ok: true }))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true;
-  }
-
   // ── Expect a new PDF tab (content script couldn't grab URL) ──
   if (msg.type === "EXPECT_PDF_TAB") {
     clearPdfWatch();
@@ -277,84 +258,6 @@ function triggerDownload(url, filename) {
       }
     );
   });
-}
-
-/**
- * Runs in the page MAIN world via chrome.scripting.executeScript.
- * Must be self-contained (no closure references) — only uses `args`.
- */
-function installPageBridge(filename, installLinkIntercept) {
-  window.__lbrd_currentFilename = filename || "Unknown_Candidate_Resume.pdf";
-
-  function downloadUrl(url) {
-    var s = String(url || "");
-    window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
-    fetch(s, { credentials: "include" })
-      .then(function (r) {
-        return r.arrayBuffer();
-      })
-      .then(function (buf) {
-        var blob = new Blob([buf], { type: "application/pdf" });
-        var u = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = u;
-        a.download = window.__lbrd_currentFilename || "Resume.pdf";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(function () {
-          URL.revokeObjectURL(u);
-        }, 15000);
-        window.postMessage({ __lbrd_download_done: true }, "*");
-      })
-      .catch(function (err) {
-        window.postMessage(
-          {
-            __lbrd_download_failed: true,
-            error: err && err.message ? err.message : String(err),
-          },
-          "*"
-        );
-      });
-  }
-
-  if (!window.__lbrd_origOpen) {
-    window.__lbrd_origOpen = window.open;
-  }
-  window.open = function (url) {
-    downloadUrl(url);
-    return null;
-  };
-
-  if (installLinkIntercept && !window.__lbrd_linkInterceptInstalled) {
-    window.__lbrd_linkInterceptInstalled = true;
-    document.addEventListener(
-      "click",
-      function (e) {
-        var a = e.target.closest ? e.target.closest("a") : null;
-        if (
-          !a ||
-          !a.href ||
-          !(a.target === "_blank" || a.getAttribute("target") === "_blank")
-        ) {
-          return;
-        }
-        var href = a.href.toLowerCase();
-        if (
-          href.includes(".pdf") ||
-          href.includes("mediaauth") ||
-          href.includes("resume") ||
-          href.includes("dms/") ||
-          href.includes("media.licdn")
-        ) {
-          e.preventDefault();
-          e.stopPropagation();
-          downloadUrl(a.href);
-        }
-      },
-      true
-    );
-  }
 }
 
 // ── Filename Builder ──────────────────────────────────────
