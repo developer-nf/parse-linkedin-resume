@@ -1,5 +1,5 @@
 /**
- * content.js – LinkedIn Bulk Resume Downloader  (v6)
+ * content.js – LinkedIn Bulk Resume Downloader  (v5)
  *
  * LinkedIn uses obfuscated/hashed CSS class names that change frequently,
  * so we detect elements by STRUCTURE and CONTENT, not class names.
@@ -518,162 +518,131 @@ if (window.__lbrd_cleanup) {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  MAIN-WORLD INTERCEPT (via background chrome.scripting)
-  //  Content scripts are isolated and cannot override page window.open.
-  //  Inline <script> injection is blocked by LinkedIn CSP — background
-  //  injects installPageBridge() with world: "MAIN" instead.
+  //  INTERCEPT window.open IN THE MAIN WORLD via <script> injection
+  //  Content scripts run in an isolated world — they CANNOT override
+  //  the page's window.open. We must inject into the page itself.
+  //  The injected code ALSO fetches the PDF as a blob and triggers
+  //  a download directly (so the one-time URL isn't wasted).
   // ══════════════════════════════════════════════════════════
 
   let interceptedUrl = null;
   let mainWorldDownloaded = false;
-  let mainWorldFailed = false;
   let interceptListenerActive = false;
-  let pageBridgeReady = null;
 
-  function ensurePageBridge() {
-    if (!pageBridgeReady) {
-      pageBridgeReady = new Promise((resolve) => {
-        chrome.runtime.sendMessage({ type: "ENSURE_PAGE_BRIDGE" }, (resp) => {
-          if (chrome.runtime.lastError || !resp || !resp.ok) {
-            log(`  ⚠ MAIN-world bridge failed: ${(chrome.runtime.lastError && chrome.runtime.lastError.message) || (resp && resp.error) || "unknown"}`);
-            pageBridgeReady = null;
-            resolve(false);
-            return;
-          }
-          resolve(true);
-        });
-      });
-    }
-    return pageBridgeReady;
-  }
-
-  // Install early so target=_blank resume links are caught
-  ensurePageBridge();
-
-  function clearPdfTabWatch() {
-    chrome.runtime.sendMessage({ type: "CLEAR_PDF_TAB" }).catch(() => {});
-  }
-
-  function armPageBridge(candidateName, active) {
-    const filename = buildDownloadFilename(candidateName);
-    return new Promise((resolve) => {
-      chrome.runtime.sendMessage(
-        { type: "ARM_PAGE_BRIDGE", candidateName, filename, active },
-        (resp) => {
-          if (chrome.runtime.lastError || !resp || !resp.ok) {
-            resolve(null);
-            return;
-          }
-          resolve(resp.filename || filename);
-        }
-      );
-    });
-  }
-
-  async function startWindowOpenIntercept(candidateName) {
+  function startWindowOpenIntercept(candidateName) {
     interceptedUrl = null;
     mainWorldDownloaded = false;
-    mainWorldFailed = false;
 
+    // Listen for messages from the injected page script (only add once)
     if (!interceptListenerActive) {
       window.addEventListener("message", onInterceptMessage);
       interceptListenerActive = true;
     }
 
-    await ensurePageBridge();
-    await armPageBridge(candidateName, true);
-  }
+    const filename = buildDownloadFilename(candidateName);
 
-  async function disarmPageBridge() {
-    await armPageBridge("Unknown_Candidate", false);
+    // Inject a <script> into the page's main world
+    // Re-inject every time to update the filename for the current candidate
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        if (!window.__lbrd_origOpen) {
+          window.__lbrd_origOpen = window.open;
+        }
+        window.__lbrd_currentFilename = ${JSON.stringify(filename)};
+        window.open = function(url) {
+          var s = String(url || "");
+          window.postMessage({ __lbrd_intercepted: true, url: s }, "*");
+          fetch(s, { credentials: "include" })
+            .then(function(r) { return r.blob(); })
+            .then(function(blob) {
+              var u = URL.createObjectURL(blob);
+              var a = document.createElement("a");
+              a.href = u;
+              a.download = window.__lbrd_currentFilename || "Resume.pdf";
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
+              window.postMessage({ __lbrd_download_done: true }, "*");
+            })
+            .catch(function(err) {
+              window.postMessage({ __lbrd_download_failed: true, error: err.message }, "*");
+            });
+          return null;
+        };
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
   }
 
   function onInterceptMessage(event) {
     if (event.source !== window) return;
     if (event.data && event.data.__lbrd_intercepted) {
       interceptedUrl = event.data.url;
-      log(`  ✓ Intercepted URL (main world): ${String(interceptedUrl).substring(0, 80)}…`);
+      log(`  ✓ Intercepted URL (main world): ${interceptedUrl.substring(0, 80)}…`);
     }
     if (event.data && event.data.__lbrd_download_done) {
       mainWorldDownloaded = true;
       log("  ✓ Main-world fetch+download succeeded!");
     }
     if (event.data && event.data.__lbrd_download_failed) {
-      mainWorldFailed = true;
       log(`  ⚠ Main-world fetch failed: ${event.data.error}`);
     }
   }
 
-  /** Poll until MAIN-world download finishes or we have a URL to retry. */
-  async function waitForInterceptResult(maxWaitMs = 20000) {
-    const start = Date.now();
-    while (Date.now() - start < maxWaitMs) {
-      if (mainWorldDownloaded) {
-        return { url: interceptedUrl, downloadedInMainWorld: true };
-      }
-      if (mainWorldFailed && interceptedUrl) {
-        return { url: interceptedUrl, downloadedInMainWorld: false };
-      }
-      await sleep(250);
-    }
-    return {
-      url: interceptedUrl,
-      downloadedInMainWorld: mainWorldDownloaded,
-    };
-  }
-
+  // Don't restore window.open between downloads — keep it patched
   function checkInterceptResult() {
-    const result = {
-      url: interceptedUrl,
-      downloadedInMainWorld: mainWorldDownloaded,
-    };
+    const result = { url: interceptedUrl, downloadedInMainWorld: mainWorldDownloaded };
     interceptedUrl = null;
     mainWorldDownloaded = false;
-    mainWorldFailed = false;
     return result;
   }
 
-  async function queueBackgroundDownload(url, candidateName) {
-    return new Promise((resolve) => {
-      chrome.runtime.sendMessage(
-        { type: "DOWNLOAD_RESUME", url, candidateName },
-        (resp) => {
-          if (chrome.runtime.lastError) {
-            resolve(false);
-            return;
+  // ══════════════════════════════════════════════════════════
+  //  INTERCEPT <a target="_blank"> clicks (another way LinkedIn opens PDFs)
+  // ══════════════════════════════════════════════════════════
+
+  function interceptLinkClicks() {
+    const script = document.createElement("script");
+    script.textContent = `
+      (function() {
+        document.addEventListener("click", function(e) {
+          var a = e.target.closest ? e.target.closest("a") : null;
+          if (a && a.href && (a.target === "_blank" || a.getAttribute("target") === "_blank")) {
+            var href = a.href.toLowerCase();
+            if (href.includes(".pdf") || href.includes("mediaauth") || href.includes("resume")
+                || href.includes("dms/") || href.includes("media.licdn")) {
+              e.preventDefault();
+              e.stopPropagation();
+              window.postMessage({ __lbrd_intercepted: true, url: a.href }, "*");
+              // Also fetch and download
+              fetch(a.href, { credentials: "include" })
+                .then(function(r) { return r.blob(); })
+                .then(function(blob) {
+                  var u = URL.createObjectURL(blob);
+                  var el = document.createElement("a");
+                  el.href = u;
+                  el.download = "Resume.pdf";
+                  document.body.appendChild(el);
+                  el.click();
+                  el.remove();
+                  setTimeout(function() { URL.revokeObjectURL(u); }, 15000);
+                  window.postMessage({ __lbrd_download_done: true }, "*");
+                })
+                .catch(function() {});
+            }
           }
-          resolve(!!(resp && (resp.queued || resp.ok)));
-        }
-      );
-    });
+        }, true);
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove();
   }
 
-  async function waitForPdfTabDownload(candidateName, maxWaitMs = 25000) {
-    const start = Date.now();
-    await sleep(400);
-    while (Date.now() - start < maxWaitMs) {
-      const status = await new Promise((resolve) => {
-        chrome.runtime.sendMessage(
-          { type: "PDF_TAB_STATUS", candidateName },
-          (resp) => {
-            if (chrome.runtime.lastError) resolve({});
-            else resolve(resp || {});
-          }
-        );
-      });
-      if (status.saved || status.lastSavedCandidate === candidateName) {
-        log(`  ✓ Confirmed save via tab watcher: ${status.lastSavedCandidate || candidateName}`);
-        return true;
-      }
-      if (!status.watching && status.lastError) {
-        log(`  ⚠ Tab watcher: ${status.lastError}`);
-        return false;
-      }
-      await sleep(500);
-    }
-    clearPdfTabWatch();
-    return false;
-  }
+  // Inject link click interceptor on load
+  interceptLinkClicks();
 
   // ══════════════════════════════════════════════════════════
   //  CLOSE popup
@@ -748,7 +717,6 @@ if (window.__lbrd_cleanup) {
 
         // Pause before interacting with download button
         await rsleep(200);
-        clearPdfTabWatch();
 
         // ── Always tell background to watch for new PDF tabs as LAST-RESORT safety net ──
         chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
@@ -762,79 +730,59 @@ if (window.__lbrd_cleanup) {
           log(`  Step 3: Direct PDF URL found, fetching blob…`);
           dlSuccess = await downloadViaFetch(pdfUrl, name);
           if (!dlSuccess) {
+            // Fallback: send to background
             log(`  Step 3: Blob failed, sending URL to background…`);
-            dlSuccess = await queueBackgroundDownload(pdfUrl, name);
-            if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(name, 20000);
-          } else {
-            clearPdfTabWatch();
+            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name });
           }
         } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
           // It's a link — fetch as blob
           log(`  Step 3: Download link href found, fetching blob…`);
           dlSuccess = await downloadViaFetch(downloadBtn.href, name);
           if (!dlSuccess) {
-            dlSuccess = await queueBackgroundDownload(downloadBtn.href, name);
-            if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(name, 20000);
-          } else {
-            clearPdfTabWatch();
+            chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: downloadBtn.href, candidateName: name });
           }
         } else {
           // Must click the button — intercept window.open in main world
           // The injected script will ALSO fetch+download the PDF as a blob
           log("  Step 3: Clicking Download (with main-world interception + fetch)…");
 
-          await startWindowOpenIntercept(name);
+          startWindowOpenIntercept(name);
+
+          // Human-like click on the download button
           await humanClick(downloadBtn);
 
-          const result = await waitForInterceptResult(20000);
-          await disarmPageBridge();
+          await sleep(1500 + Math.random() * 1500); // wait for fetch+download in main world
 
+          const result = checkInterceptResult();
           if (result.downloadedInMainWorld) {
             log("  ✓ Downloaded via main-world fetch!");
             dlSuccess = true;
-            clearPdfTabWatch();
           } else if (result.url) {
+            // Main world fetch failed but we got the URL — try from content script
             log("  Step 3: Trying content-script fetch with captured URL…");
             dlSuccess = await downloadViaFetch(result.url, name);
             if (!dlSuccess) {
-              dlSuccess = await queueBackgroundDownload(result.url, name);
-              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(name, 20000);
-              else clearPdfTabWatch();
-            } else {
-              clearPdfTabWatch();
+              // Last resort: send URL to background
+              chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: result.url, candidateName: name });
             }
           } else {
+            // Nothing intercepted — check for PDF URL that appeared after click
             const postClickUrl = extractPdfUrl();
             if (postClickUrl) {
               log(`  Step 3: Found PDF URL after click, fetching…`);
               dlSuccess = await downloadViaFetch(postClickUrl, name);
               if (!dlSuccess) {
-                dlSuccess = await queueBackgroundDownload(postClickUrl, name);
-                if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(name, 20000);
-                else clearPdfTabWatch();
-              } else {
-                clearPdfTabWatch();
+                chrome.runtime.sendMessage({ type: "DOWNLOAD_RESUME", url: postClickUrl, candidateName: name });
               }
             } else {
-              log("  Step 3: Waiting for background PDF tab watcher…");
-              dlSuccess = await waitForPdfTabDownload(name, 25000);
+              log("  Step 3: Relying on background tab watcher (last resort)");
             }
           }
-
-          checkInterceptResult(); // reset intercept flags for next applicant
         }
 
-        if (dlSuccess) {
-          downloaded++;
-          log(`  ✓ Downloaded: ${name}`);
-          notify("PROGRESS", { downloaded, total, failed, candidateName: name });
-        } else {
-          failed++;
-          log(`  ✗ Download not confirmed for ${name}`);
-          notify("DOWNLOAD_ERROR", { candidateName: name, error: "Download not confirmed" });
-          notify("PROGRESS", { downloaded, total, failed });
-          clearPdfTabWatch();
-        }
+        downloaded++;
+        log(`  ✓ Downloaded: ${name}`);
+        notify("PROGRESS", { downloaded, total, failed, candidateName: name });
 
         log("  Step 4: Closing popup…");
         await rsleep(800);
@@ -974,5 +922,5 @@ if (window.__lbrd_cleanup) {
   chrome.runtime.onMessage.addListener(messageHandler);
   window.__lbrd_cleanup = () => chrome.runtime.onMessage.removeListener(messageHandler);
 
-  console.log("[LBRD] Content script v6 loaded (MAIN-world via scripting API).");
+  console.log("[LBRD] Content script v5 loaded.");
 })();
