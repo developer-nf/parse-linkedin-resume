@@ -32,6 +32,40 @@ if (window.__lbrd_cleanup) {
   const rsleep = (ms) => new Promise((r) => setTimeout(r, Math.random() * ms));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  /** Random pause in [minMs, maxMs] — uneven timing looks less bot-like. */
+  function humanPause(minMs, maxMs) {
+    const lo = Math.min(minMs, maxMs);
+    const hi = Math.max(minMs, maxMs);
+    return sleep(lo + Math.random() * (hi - lo));
+  }
+
+  /**
+   * Gap between applicants: normally 3–12s; ~10% chance of a longer 15–30s
+   * "think" pause. Every 8–12 applicants, add an extra cool-down.
+   */
+  let applicantsSinceLongBreak = 0;
+  const longBreakEvery = 8 + Math.floor(Math.random() * 5); // 8–12
+
+  async function humanPauseBetweenApplicants() {
+    applicantsSinceLongBreak++;
+    let ms;
+    if (Math.random() < 0.1) {
+      ms = 15000 + Math.random() * 15000; // 15–30s
+      log(`  ⏳ Longer human pause ${(ms / 1000).toFixed(1)}s…`);
+    } else {
+      ms = 3000 + Math.random() * 9000; // 3–12s
+      log(`  ⏳ Waiting ${(ms / 1000).toFixed(1)}s…`);
+    }
+    await sleep(ms);
+
+    if (applicantsSinceLongBreak >= longBreakEvery) {
+      applicantsSinceLongBreak = 0;
+      const cool = 20000 + Math.random() * 20000; // 20–40s
+      log(`  ⏳ Cool-down pause ${(cool / 1000).toFixed(1)}s…`);
+      await sleep(cool);
+    }
+  }
+
   // ── Human-like mouse movement + click ───────────────────
   // Simulates: jitter → smooth glide → jitter → hover → click
   // with randomized timing to mimic real human behavior.
@@ -360,8 +394,11 @@ if (window.__lbrd_cleanup) {
     const selectors = [
       ".hiring-applicant-header h1",
       ".hiring-applicant-header .artdeco-entity-lockup__title",
+      ".hiring-applicant-header .artdeco-entity-lockup__title span",
       "#hiring-detail-root h1",
       ".hiring-applicants__right-column h1",
+      ".hiring-applicant-detail h1",
+      '[data-test-row-lockup-full-name]',
     ];
     for (const sel of selectors) {
       const header = document.querySelector(sel);
@@ -371,6 +408,7 @@ if (window.__lbrd_cleanup) {
         .replace(/['’]s application.*/i, "")
         .replace(/\d+(st|nd|rd|th).*/i, "")
         .replace(/degree connection/gi, "")
+        .replace(/unviewed\s+applicant/gi, "")
         .split("\n")[0]
         .trim();
       const cleaned = sanitiseName(raw.replace(/[·•].*$/, "").trim());
@@ -444,6 +482,56 @@ if (window.__lbrd_cleanup) {
     return /Scanning resume for viruses/i.test(text);
   }
 
+  /** applicationId from card link — used when name is still "Unviewed applicant". */
+  function extractApplicationId(card) {
+    const el = card?.element || card;
+    if (!el || !el.querySelectorAll) return "";
+    for (const a of el.querySelectorAll("a[href]")) {
+      const href = a.getAttribute("href") || "";
+      const m = href.match(/applicationId[=:](\d+)/i) || href.match(/\/applicants\/(\d+)/);
+      if (m) return m[1];
+    }
+    return "";
+  }
+
+  /**
+   * Prefer a real person name from the detail panel (and refreshed list card).
+   * Falls back to Application_<id> instead of leaving "Unviewed_applicant".
+   */
+  async function resolveApplicantName(card, fallbackName, maxWaitMs = 6000) {
+    const start = Date.now();
+    let best = fallbackName;
+
+    while (Date.now() - start < maxWaitMs) {
+      const detailName = extractNameFromDetailPanel();
+      if (detailName) {
+        card.name = detailName;
+        return detailName;
+      }
+
+      // List card often updates from "Unviewed applicant" → real name after open
+      const fromCard = extractNameFromCard(card.element);
+      if (fromCard && fromCard !== "Unviewed_applicant" && fromCard !== "Unknown_Candidate") {
+        card.name = fromCard;
+        return fromCard;
+      }
+
+      await humanPause(400, 700);
+    }
+
+    if (!best || best === "Unviewed_applicant" || best === "Unknown_Candidate") {
+      const appId = extractApplicationId(card);
+      if (appId) {
+        best = `Application_${appId}`;
+        card.name = best;
+        log(`  Using application id for filename: ${best}`);
+        return best;
+      }
+    }
+
+    return best || fallbackName;
+  }
+
   async function waitForHiringResumeUrl(maxWaitMs = 12000) {
     const start = Date.now();
     let loggedVirus = false;
@@ -456,38 +544,66 @@ if (window.__lbrd_cleanup) {
           log("  ⏳ LinkedIn virus scan in progress — waiting for download control…");
           loggedVirus = true;
         }
+        await humanPause(1000, 2000);
+      } else {
+        const detail = document.querySelector(
+          ".hiring-applicant-detail, #hiring-detail-root, .hiring-applicants__right-column, .scaffold-layout__detail, main"
+        );
+        if (detail) detail.scrollTop = (detail.scrollTop || 0) + 200;
+        await humanPause(500, 900);
       }
-
-      const detail = document.querySelector(
-        ".hiring-applicant-detail, #hiring-detail-root, .hiring-applicants__right-column, .scaffold-layout__detail, main"
-      );
-      if (detail) detail.scrollTop = (detail.scrollTop || 0) + 200;
-
-      await sleep(400 + Math.random() * 200);
     }
     return null;
   }
 
   /**
-   * Wait out LinkedIn's virus-scan interstitial, then return the resume URL.
-   * If scan text persists, re-select the applicant once to reload the detail panel
-   * (LinkedIn's own copy says "Please refresh").
+   * Soft-refresh resume viewer without full page reload (full reload kills the bulk loop).
+   * Opens a different applicant briefly, then returns — forces LinkedIn to remount the panel.
+   */
+  async function softRefreshResumePanel(card) {
+    const others = applicantCards.filter((c) => c.element !== card.element);
+    if (others.length > 0) {
+      const neighbor = others[Math.floor(Math.random() * Math.min(3, others.length))];
+      log("  Soft-refresh: briefly opening another applicant, then returning…");
+      await selectApplicant(neighbor);
+      await humanPause(800, 1500);
+    } else {
+      log("  Soft-refresh: re-selecting same applicant…");
+    }
+    await selectApplicant(card);
+    await humanPause(1500, 2500);
+  }
+
+  /**
+   * Wait for virus-scan to clear + resume URL.
+   * First pass is capped (~45s) so one stuck scan doesn't block the whole run;
+   * callers can retry later via the end-of-run queue.
    */
   async function waitForResumeReady(card, maxWaitMs = 45000) {
-    let url = await waitForHiringResumeUrl(Math.min(15000, maxWaitMs));
+    const deadline = Date.now() + maxWaitMs;
+
+    let url = await waitForHiringResumeUrl(Math.min(18000, maxWaitMs));
     if (url) return url;
 
-    if (isVirusScanBlocking() || !getHiringResumeDownloadUrl()) {
-      log("  Virus scan / no download yet — re-selecting applicant to refresh panel…");
+    if (Date.now() < deadline && (isVirusScanBlocking() || !getHiringResumeDownloadUrl())) {
+      await softRefreshResumePanel(card);
+      const remaining = Math.max(5000, deadline - Date.now());
+      url = await waitForHiringResumeUrl(Math.min(20000, remaining));
+      if (url) return url;
+    }
+
+    if (Date.now() < deadline && (isVirusScanBlocking() || !getHiringResumeDownloadUrl())) {
+      log("  Soft-refresh: second re-select…");
       await selectApplicant(card);
-      await sleep(1500 + Math.random() * 1000);
-      url = await waitForHiringResumeUrl(Math.max(20000, maxWaitMs - 15000));
+      await humanPause(2000, 3500);
+      const remaining = Math.max(4000, deadline - Date.now());
+      url = await waitForHiringResumeUrl(Math.min(12000, remaining));
       if (url) return url;
     }
 
     if (!url) {
       await tryOpenMoreMenuForResume();
-      url = await waitForHiringResumeUrl(5000);
+      url = await waitForHiringResumeUrl(Math.min(6000, Math.max(0, deadline - Date.now())));
     }
 
     if (!url) {
@@ -537,7 +653,7 @@ if (window.__lbrd_cleanup) {
     await humanClick(clickTarget);
 
     // Hiring Manager Ember UI needs more time for detail + resume viewer
-    await sleep(1200 + Math.random() * 1200);
+    await humanPause(1500, 3500);
   }
 
 
@@ -883,10 +999,10 @@ if (window.__lbrd_cleanup) {
   }
 
   /** Poll background until the PDF-tab watcher confirms a download (or times out). */
-  async function waitForPdfTabDownload(maxWaitMs = 10000) {
+  async function waitForPdfTabDownload(maxWaitMs = 25000) {
     const start = Date.now();
     // Brief grace so EXPECT_PDF_TAB / DOWNLOAD_RESUME can register
-    await sleep(300);
+    await humanPause(300, 600);
     while (Date.now() - start < maxWaitMs) {
       const status = await new Promise((resolve) => {
         chrome.runtime.sendMessage({ type: "PDF_TAB_STATUS" }, (resp) => {
@@ -904,7 +1020,7 @@ if (window.__lbrd_cleanup) {
       }
       // If watch already cleared with no save and no error, keep polling briefly
       // (DOWNLOAD_RESUME may still be finishing)
-      await sleep(400);
+      await humanPause(500, 800);
     }
     clearPdfTabWatch();
     return false;
@@ -994,6 +1110,8 @@ if (window.__lbrd_cleanup) {
 
     log(`Starting bulk download for ${total} applicant(s)…`);
     log(`  Detected UI: ${hiringUI ? "Hiring Manager (Jobs applicants)" : "Talent Hub / Recruiter-style"}`);
+    applicantsSinceLongBreak = 0;
+    const virusRetryQueue = []; // cards blocked by virus scan on first pass
 
     chrome.runtime.sendMessage({ type: "DOWNLOAD_STARTED", total }).catch(() => {});
 
@@ -1014,13 +1132,9 @@ if (window.__lbrd_cleanup) {
         log("  Step 1: Selecting applicant…");
         await selectApplicant(card);
 
-        // Prefer real name from detail header ("Rahul Parashar's application")
-        const detailName = extractNameFromDetailPanel();
-        if (detailName) {
-          name = detailName;
-          card.name = detailName;
-          log(`  Name from detail panel: ${name}`);
-        }
+        // Resolve real name (detail panel / updated list card / applicationId)
+        name = await resolveApplicantName(card, name, 6000);
+        log(`  Using name: ${name}`);
         setCurrentFilenameInPage(name);
 
         let dlSuccess = false;
@@ -1028,10 +1142,13 @@ if (window.__lbrd_cleanup) {
         // ── Path A: Hiring Manager — resume PDF link in the detail pane ──
         if (hiringUI || document.querySelector(".hiring-applicant-header")) {
           log("  Step 2: Looking for Hiring resume download link (incl. virus-scan wait)…");
+          name = await resolveApplicantName(card, name, 2500);
           setCurrentFilenameInPage(name);
           const pdfUrl = await waitForResumeReady(card, 45000);
 
           if (pdfUrl) {
+            name = await resolveApplicantName(card, name, 2000);
+            setCurrentFilenameInPage(name);
             log("  Step 3: Fetching resume blob…");
             dlSuccess = await downloadViaFetch(pdfUrl, name);
             if (!dlSuccess) {
@@ -1044,21 +1161,25 @@ if (window.__lbrd_cleanup) {
                 );
               });
               if (!dlSuccess) {
-                dlSuccess = await waitForPdfTabDownload(12000);
+                dlSuccess = await waitForPdfTabDownload(25000);
               } else {
                 clearPdfTabWatch();
               }
             }
           } else {
             const stillScanning = isVirusScanBlocking();
-            const errMsg = stillScanning
-              ? "LinkedIn virus scan never finished — no download control appeared"
-              : "No resume download link found";
-            log(`  ✗ ${errMsg} for ${name}`);
-            failed++;
-            notify("DOWNLOAD_ERROR", { candidateName: name, error: errMsg });
-            notify("PROGRESS", { downloaded, total, failed });
-            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            if (stillScanning) {
+              log(`  ⏸ Virus scan still blocking ${name} — will retry at end of run`);
+              virusRetryQueue.push(card);
+              notify("PROGRESS", { downloaded, total, failed, candidateName: name });
+            } else {
+              const errMsg = "No resume download link found";
+              log(`  ✗ ${errMsg} for ${name}`);
+              failed++;
+              notify("DOWNLOAD_ERROR", { candidateName: name, error: errMsg });
+              notify("PROGRESS", { downloaded, total, failed });
+            }
+            if (i < applicantCards.length - 1) await humanPauseBetweenApplicants();
             continue;
           }
         } else {
@@ -1069,7 +1190,7 @@ if (window.__lbrd_cleanup) {
             log(`  ✗ No Resume button for ${name}`);
             failed++;
             notify("PROGRESS", { downloaded, total, failed });
-            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            if (i < applicantCards.length - 1) await humanPauseBetweenApplicants();
             continue;
           }
 
@@ -1077,18 +1198,18 @@ if (window.__lbrd_cleanup) {
           await humanClick(resumeBtn);
 
           log("  Step 3: Waiting for popup…");
-          await sleep(600 + Math.random() * 600);
+          await humanPause(1000, 2500);
           const downloadBtn = await findDownloadButton(10000);
           if (!downloadBtn) {
             log(`  ✗ No Download button for ${name}`);
             failed++;
             await closePreviewPopup();
             notify("PROGRESS", { downloaded, total, failed });
-            if (i < applicantCards.length - 1) await randomDelay(0, 3);
+            if (i < applicantCards.length - 1) await humanPauseBetweenApplicants();
             continue;
           }
 
-          await rsleep(200);
+          await humanPause(200, 500);
           setCurrentFilenameInPage(name);
 
           let pdfUrl = extractPdfUrl();
@@ -1104,7 +1225,7 @@ if (window.__lbrd_cleanup) {
                   (resp) => resolve(!!(resp && resp.ok))
                 );
               });
-              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(25000);
               else clearPdfTabWatch();
             }
           } else if (downloadBtn.tagName === "A" && downloadBtn.href) {
@@ -1118,7 +1239,7 @@ if (window.__lbrd_cleanup) {
                   (resp) => resolve(!!(resp && resp.ok))
                 );
               });
-              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(25000);
               else clearPdfTabWatch();
             }
           } else {
@@ -1126,7 +1247,7 @@ if (window.__lbrd_cleanup) {
             chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
             startWindowOpenIntercept(name);
             await humanClick(downloadBtn);
-            await sleep(1500 + Math.random() * 1500);
+            await humanPause(2000, 4000);
 
             const result = checkInterceptResult();
             if (result.downloadedInMainWorld) {
@@ -1141,7 +1262,7 @@ if (window.__lbrd_cleanup) {
                     (resp) => resolve(!!(resp && resp.ok))
                   );
                 });
-                if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+                if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(25000);
                 else clearPdfTabWatch();
               }
             } else {
@@ -1155,12 +1276,12 @@ if (window.__lbrd_cleanup) {
                       (resp) => resolve(!!(resp && resp.ok))
                     );
                   });
-                  if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(10000);
+                  if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(25000);
                   else clearPdfTabWatch();
                 }
               } else {
                 log("  Step 3: Waiting for background PDF tab watcher…");
-                dlSuccess = await waitForPdfTabDownload(8000);
+                dlSuccess = await waitForPdfTabDownload(25000);
                 if (!dlSuccess) {
                   log("  ✗ No PDF URL and tab watcher did not confirm a download");
                 }
@@ -1169,15 +1290,17 @@ if (window.__lbrd_cleanup) {
           }
 
           log("  Step 4: Closing popup…");
-          await rsleep(800);
+          await humanPause(600, 1200);
           await closePreviewPopup();
-          await rsleep(500);
+          await humanPause(400, 900);
         }
 
         if (dlSuccess) {
           downloaded++;
           log(`  ✓ Downloaded: ${name}`);
           notify("PROGRESS", { downloaded, total, failed, candidateName: name });
+          // Brief settle after a successful save before pacing to next applicant
+          await humanPause(2000, 5000);
         } else {
           failed++;
           notify("PROGRESS", { downloaded, total, failed });
@@ -1188,13 +1311,77 @@ if (window.__lbrd_cleanup) {
         notify("DOWNLOAD_ERROR", { candidateName: name, error: err.message });
         notify("PROGRESS", { downloaded, total, failed });
         await closePreviewPopup();
-        await rsleep(300);
+        await humanPause(300, 700);
       }
 
       if (i < applicantCards.length - 1 && !stopRequested) {
-        const d = Math.random() * 5;
-        log(`  ⏳ Waiting ${d.toFixed(1)}s…`);
-        await randomDelay(0, 5);
+        await humanPauseBetweenApplicants();
+      }
+    }
+
+    // ── End-of-run retry for virus-scan blocks (scan often finishes by then) ──
+    if (virusRetryQueue.length > 0 && !stopRequested) {
+      log(`\n🔁 Retrying ${virusRetryQueue.length} applicant(s) blocked by virus scan…`);
+      await humanPause(4000, 8000);
+
+      for (let r = 0; r < virusRetryQueue.length; r++) {
+        if (stopRequested) break;
+        const card = virusRetryQueue[r];
+        let name = card.name || "Unknown_Candidate";
+        log(`\n━━━ [retry ${r + 1}/${virusRetryQueue.length}] ${name} ━━━`);
+        clearPdfTabWatch();
+
+        try {
+          await selectApplicant(card);
+          name = await resolveApplicantName(card, name, 6000);
+          setCurrentFilenameInPage(name);
+          log(`  Using name: ${name}`);
+
+          const pdfUrl = await waitForResumeReady(card, 60000);
+          if (!pdfUrl) {
+            const errMsg = isVirusScanBlocking()
+              ? "LinkedIn virus scan never finished — no download control appeared"
+              : "No resume download link found";
+            log(`  ✗ Retry failed: ${errMsg} for ${name}`);
+            failed++;
+            notify("DOWNLOAD_ERROR", { candidateName: name, error: errMsg });
+            notify("PROGRESS", { downloaded, total, failed });
+          } else {
+            name = await resolveApplicantName(card, name, 2000);
+            setCurrentFilenameInPage(name);
+            log("  Fetching resume blob (retry)…");
+            let dlSuccess = await downloadViaFetch(pdfUrl, name);
+            if (!dlSuccess) {
+              chrome.runtime.sendMessage({ type: "EXPECT_PDF_TAB", candidateName: name });
+              dlSuccess = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                  { type: "DOWNLOAD_RESUME", url: pdfUrl, candidateName: name },
+                  (resp) => resolve(!!(resp && resp.ok))
+                );
+              });
+              if (!dlSuccess) dlSuccess = await waitForPdfTabDownload(25000);
+              else clearPdfTabWatch();
+            }
+            if (dlSuccess) {
+              downloaded++;
+              log(`  ✓ Downloaded on retry: ${name}`);
+              notify("PROGRESS", { downloaded, total, failed, candidateName: name });
+            } else {
+              failed++;
+              notify("DOWNLOAD_ERROR", { candidateName: name, error: "Download failed on virus-scan retry" });
+              notify("PROGRESS", { downloaded, total, failed });
+            }
+          }
+        } catch (err) {
+          failed++;
+          log(`  ✗ Retry error: ${err.message}`);
+          notify("DOWNLOAD_ERROR", { candidateName: name, error: err.message });
+          notify("PROGRESS", { downloaded, total, failed });
+        }
+
+        if (r < virusRetryQueue.length - 1 && !stopRequested) {
+          await humanPauseBetweenApplicants();
+        }
       }
     }
 
