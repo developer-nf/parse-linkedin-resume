@@ -138,18 +138,43 @@ async function init() {
 
       const count = response.count || 0;
       updateProgress(0, count);
+      const onDetailPage = /\/applicants\/\d+/i.test(url);
 
       if (count === 0) {
         setStatus("idle", "No applicant cards found — try Debug Scan");
         btnStart.textContent = "No Applicants Found";
         btnStart.disabled = true;
-        addLog("0 applicant cards detected. Scroll down to load more, then re-open popup.", "error");
+        if (onDetailPage) {
+          addLog(
+            "Detail page open, but no applicant/resume controls matched. Wait for the resume viewer to load, then Debug Scan — or open the applicants list for bulk download.",
+            "error"
+          );
+        } else {
+          addLog("0 applicant cards detected. Scroll down to load more, then re-open popup.", "error");
+        }
         runDebugScan();
       } else {
         setStatus("idle", `Found ${count} applicant(s) ready to download`);
-        btnStart.textContent = `▶ Start Bulk Download (${count})`;
+        const singleDetailOnly = count === 1 && onDetailPage;
+        btnStart.textContent = singleDetailOnly
+          ? "▶ Download This Applicant"
+          : `▶ Start Bulk Download (${count})`;
         btnStart.disabled = false;
-        addLog(`Scan complete — ${count} applicant(s) found in the list.`, "success");
+        if (singleDetailOnly) {
+          addLog(
+            "Only 1 applicant detected. If the left list is visible, scroll it and re-open the popup — or click Debug Scan.",
+            "info"
+          );
+          addLog("Detail page mode — 1 open applicant ready to download.", "success");
+        } else {
+          addLog(`Scan complete — ${count} applicant(s) visible in the DOM right now.`, "success");
+          if (count > 0 && count <= 20) {
+            addLog(
+              "LinkedIn only keeps ~10–20 applicants mounted in the left list. Click Start — it will scroll the list and collect more before downloading.",
+              "info"
+            );
+          }
+        }
       }
     });
   } catch (err) {
@@ -171,10 +196,23 @@ function runDebugScan() {
     }
 
     const d = response.debug;
+    const onDetail = !!(d.isDetailPage || d.detailMode);
     addLog(`Page: ${d.url}`, "info");
-    addLog(`UI: ${d.hiringUI ? "Hiring Manager" : "Talent/Recruiter"} | List items: ${d.hiringListItems ?? "?"}`, "info");
+    if (onDetail) {
+      addLog(
+        `Mode: Applicant detail${d.applicationIdFromPath ? " (id " + d.applicationIdFromPath + ")" : ""}`,
+        "info"
+      );
+    }
+    addLog(
+      `UI: ${d.hiringUI ? "Hiring Manager" : "Talent/Recruiter"} | List items: ${d.hiringListItems ?? "?"}`,
+      "info"
+    );
     addLog(`Total buttons: ${d.totalButtons ?? "?"} | Total links: ${d.totalLinks ?? "?"}`, "info");
-    addLog(`Applicant cards found: ${d.applicantCardsFound}`, d.applicantCardsFound > 0 ? "success" : "error");
+    addLog(
+      `Applicant cards found: ${d.applicantCardsFound}`,
+      d.applicantCardsFound > 0 ? "success" : "error"
+    );
 
     // List applicant names found
     if (d.applicantNames && d.applicantNames.length > 0) {
@@ -188,13 +226,28 @@ function runDebugScan() {
       addLog(`Detail panel name: ${d.detailPanelName}`, "success");
     }
 
+    if (d.virusScanBlocking) {
+      addLog("LinkedIn virus scan still running — resume control may appear shortly.", "info");
+    }
+
     // Resume button / Hiring download status
+    const resumeNoMsg = onDetail
+      ? "NO — resume control not found in DOM"
+      : "NO — open an applicant first";
     addLog(
-      `Resume download available: ${d.resumeButtonVisible ? "YES (" + (d.resumeButtonText || "found") + ")" : "NO — open an applicant first"}`,
+      `Resume download available: ${
+        d.resumeButtonVisible ? "YES (" + (d.resumeButtonText || "found") + ")" : resumeNoMsg
+      }`,
       d.resumeButtonVisible ? "success" : "info"
     );
-    addLog(`ui-attachment download: ${d.uiAttachmentDownload ? "YES" : "NO"}`, d.uiAttachmentDownload ? "success" : "info");
-    addLog(`Resume viewer icon: ${d.resumeViewerDownloadIcon ? "YES" : "NO"}`, d.resumeViewerDownloadIcon ? "success" : "info");
+    addLog(
+      `ui-attachment download: ${d.uiAttachmentDownload ? "YES" : "NO"}`,
+      d.uiAttachmentDownload ? "success" : "info"
+    );
+    addLog(
+      `Resume viewer icon: ${d.resumeViewerDownloadIcon ? "YES" : "NO"}`,
+      d.resumeViewerDownloadIcon ? "success" : "info"
+    );
     if (d.hiringResumeUrlPreview) {
       addLog(`Resume URL: ${d.hiringResumeUrlPreview}…`, "success");
     }
@@ -215,6 +268,23 @@ function runDebugScan() {
         addLog(`  "${b.text}" view=${b.dataViewName}`, "info");
       });
     }
+
+    // PDF / media / download-labelled links (helps spot LinkedIn markup changes)
+    if (d.resumeLikeLinks && d.resumeLikeLinks.length > 0) {
+      addLog(`── Resume-like links (${d.resumeLikeLinks.length}):`, "info");
+      d.resumeLikeLinks.forEach((l) => {
+        addLog(`  "${l.text || "(no text)"}" → ${l.href}`, "info");
+      });
+    } else if (onDetail && !d.resumeButtonVisible) {
+      addLog("No resume-like links found on this detail page yet.", "info");
+    }
+
+    if (d.applicationLinks && d.applicationLinks.length > 0 && (d.applicantCardsFound || 0) === 0) {
+      addLog(`── Application links (${d.applicationLinks.length}):`, "info");
+      d.applicationLinks.slice(0, 8).forEach((l) => {
+        addLog(`  "${l.text || "(no text)"}" → ${l.href}`, "info");
+      });
+    }
   });
 }
 
@@ -229,8 +299,8 @@ btnStart.addEventListener("click", async () => {
   btnStart.disabled = true;
   btnStart.textContent = "⏳ Running…";
   btnStop.disabled = false;
-  setStatus("running", "Downloading resumes…");
-  addLog("Bulk download started.", "info");
+  setStatus("running", "Collecting applicants, then downloading…");
+  addLog("Bulk download started — first scrolling the list to collect applicants…", "info");
 
   chrome.tabs.sendMessage(currentTabId, { action: "START_DOWNLOAD" });
 });

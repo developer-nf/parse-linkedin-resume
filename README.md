@@ -69,7 +69,8 @@ You should see the extension listed with no errors. If there's an "Errors" butto
 
 Open any of these pages in Chrome:
 
-- `https://www.linkedin.com/hiring/jobs/...` (LinkedIn Recruiter job applicants list)
+- **Bulk download (list):** `https://www.linkedin.com/hiring/jobs/.../applicants/?…` — left-rail applicant list
+- **Single applicant (detail):** `https://www.linkedin.com/hiring/jobs/.../applicants/{id}/detail/?…` — downloads the open applicant
 - `https://www.linkedin.com/talent/...` (LinkedIn Talent Hub)
 
 > **Important:** You must be logged in to LinkedIn and have access to the recruiter / hiring tools.
@@ -111,10 +112,13 @@ Downloads/
 | Problem | Solution |
 |---|---|
 | **"Not a LinkedIn Hiring / Jobs page"** | Make sure the URL starts with `linkedin.com/hiring`, `/talent`, or `/jobs`. |
-| **"No downloadable resumes found"** | Scroll down to load more applicants first — LinkedIn lazy‑loads. Then re‑open the popup to re‑scan. |
+| **"No applicant cards" on a detail URL** | Wait until the resume viewer finishes loading (and any “Scanning resume for viruses” banner clears), then re‑open the popup or run **Debug Scan**. For many applicants, open the **list** URL instead (`…/applicants/?…` without `/detail/`). |
+| **"No downloadable resumes found"** | On the **list** page, scroll the left rail to lazy‑load more cards, then re‑open the popup. On a **detail** page, ensure a resume is attached and the download control is visible. |
+| **Popup only shows ~10 applicants** | Expected: LinkedIn virtualizes the left rail and only keeps a small window of cards in the DOM. **Start Bulk Download** scrolls the list first, collects unique applicant IDs, then downloads. It cannot exceed what LinkedIn will load into that list for your filters. |
 | **"Cannot communicate with page"** | Refresh the LinkedIn tab and try again. The content script needs to be injected first. |
 | **Downloads go to the wrong folder** | Check `chrome://settings/downloads` — the `LinkedIn_Resumes` sub‑folder is created relative to your default download directory. |
 | **Some resumes fail** | LinkedIn may rate‑limit you. Wait a few minutes and try again. The delay randomisation helps, but isn't bulletproof. |
+| **`chrome-extension://invalid/` in the page console** | Unrelated to this extension (it does not inject `chrome-extension://` asset URLs). Usually another extension or a stale extension reference — safe to ignore for resume download. |
 
 ---
 

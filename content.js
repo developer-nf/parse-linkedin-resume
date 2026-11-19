@@ -169,47 +169,180 @@ if (window.__lbrd_cleanup) {
     return !n || INVALID_CARD_NAMES.has(n) || n.startsWith("rate_");
   }
 
+  /** Match /hiring/jobs/{jobId}/applicants/{applicationId}/detail/ */
+  function getHiringDetailPathMatch() {
+    return location.pathname.match(
+      /\/hiring\/jobs\/\d+\/applicants\/(\d+)(?:\/detail)?\/?/i
+    );
+  }
+
+  function isHiringDetailPage() {
+    return /\/hiring\/jobs\/\d+\/applicants\/\d+/i.test(location.pathname);
+  }
+
+  function getApplicationIdFromPath() {
+    const m = getHiringDetailPathMatch();
+    return m ? m[1] : "";
+  }
+
+  function getJobIdFromPath() {
+    const m = location.pathname.match(/\/hiring\/jobs\/(\d+)/i);
+    return m ? m[1] : "";
+  }
+
+  function buildApplicantDetailHref(appId) {
+    const jobId = getJobIdFromPath();
+    if (!jobId || !appId) return "";
+    return `${location.origin}/hiring/jobs/${jobId}/applicants/${appId}/detail/${location.search || ""}`;
+  }
+
+  function absoluteHref(href) {
+    if (!href) return "";
+    try {
+      return new URL(href, location.origin).href;
+    } catch (_) {
+      return href;
+    }
+  }
+
+  function getDetailRootElement() {
+    return (
+      document.querySelector("#hiring-detail-root") ||
+      document.querySelector(".hiring-applicant-detail") ||
+      document.querySelector(".hiring-applicants__right-column") ||
+      document.querySelector(".scaffold-layout__detail") ||
+      document.querySelector("main") ||
+      document.body
+    );
+  }
+
+  function looksLikeApplicantListCard(text) {
+    if (!text) return false;
+    const t = text.trim();
+    if (t.length < 8 || t.length > 600) return false;
+    return (
+      /Must-have|Preferred|See more jobs|\/\d/.test(t) ||
+      /\b(1st|2nd|3rd)\b/.test(t) ||
+      /unviewed\s+applicant/i.test(t)
+    );
+  }
+
+  /** Walk up from a list link to the repeating card row (not the whole left column). */
+  function cardElementFromApplicantLink(anchor) {
+    if (!anchor) return null;
+    const preferred =
+      anchor.closest(".hiring-applicants__list-item") ||
+      anchor.closest('[class*="hiring-applicants__list-item"]') ||
+      anchor.closest('[class*="applicant-card"]') ||
+      anchor.closest('[class*="list-item"]') ||
+      anchor.closest("li") ||
+      anchor.closest("[componentkey]");
+    if (preferred) return preferred;
+
+    let el = anchor;
+    for (let depth = 0; depth < 8 && el && el.parentElement; depth++) {
+      const parent = el.parentElement;
+      const siblings = [...parent.children].filter((c) => c !== el);
+      const similarSiblings = siblings.filter((c) =>
+        looksLikeApplicantListCard(c.textContent || "")
+      ).length;
+      if (similarSiblings >= 1 && looksLikeApplicantListCard(el.textContent || "")) {
+        return el;
+      }
+      el = parent;
+    }
+    return anchor.parentElement || anchor;
+  }
+
+  function addApplicantCard(found, byAppId, el, name, appId) {
+    if (!el) return;
+    let resolved = name;
+    if (!resolved || resolved === "Unknown_Candidate") {
+      resolved = extractNameFromCard(el);
+    }
+    if (isInvalidCardName(resolved) && resolved !== "Unviewed_applicant") return;
+    if (resolved === "Unknown_Candidate") resolved = "Unviewed_applicant";
+
+    if (appId) {
+      const existing = byAppId.get(appId);
+      if (existing && existing !== el) {
+        // Prefer the smaller/more specific card node
+        if (existing.contains(el)) {
+          found.delete(existing);
+          byAppId.set(appId, el);
+          found.set(el, resolved);
+        } else if (!el.contains(existing)) {
+          found.set(el, resolved);
+          byAppId.set(appId, el);
+        }
+        return;
+      }
+      byAppId.set(appId, el);
+    }
+    found.set(el, resolved);
+  }
+
   function scanApplicantCards() {
     const found = new Map();
+    const byAppId = new Map();
 
     // ── Strategy 0: Classic Hiring Manager list (LinkedIn Jobs Hiring) ──
-    // Matches: https://www.linkedin.com/hiring/jobs/.../applicants/...
-    document.querySelectorAll(".hiring-applicants__list-item").forEach((el) => {
-      const name = extractNameFromCard(el);
-      if (!isInvalidCardName(name) || name === "Unviewed_applicant") {
-        found.set(el, name === "Unknown_Candidate" ? "Unviewed_applicant" : name);
-      }
+    document.querySelectorAll(
+      ".hiring-applicants__list-item, [class*='hiring-applicants__list-item']"
+    ).forEach((el) => {
+      const appId =
+        (el.querySelector("a[href*='/applicants/']")?.getAttribute("href") || "").match(
+          /\/applicants\/(\d+)/
+        )?.[1] || "";
+      addApplicantCard(found, byAppId, el, extractNameFromCard(el), appId);
     });
+
+    // ── Strategy 0b: Left-rail links to /hiring/jobs/.../applicants/{id}/ ──
+    // Current LinkedIn UI often drops .hiring-applicants__list-item but keeps these hrefs.
+    document.querySelectorAll('a[href*="/hiring/jobs/"][href*="/applicants/"]').forEach((a) => {
+      const href = a.getAttribute("href") || a.href || "";
+      const m = href.match(/\/applicants\/(\d+)/i);
+      if (!m) return;
+      // Skip links that live only in the detail header chrome (not the left list)
+      if (a.closest(".hiring-applicant-header, #hiring-detail-root, .hiring-applicant-detail")) {
+        // Still allow if the same node is clearly in a multi-card list parent
+        const card = cardElementFromApplicantLink(a);
+        const parent = card?.parentElement;
+        const peerCount = parent
+          ? [...parent.children].filter((c) => looksLikeApplicantListCard(c.textContent || "")).length
+          : 0;
+        if (peerCount < 2) return;
+      }
+      const card = cardElementFromApplicantLink(a);
+      if (!card) return;
+      if (!looksLikeApplicantListCard(card.textContent || "") && found.size > 0) return;
+      addApplicantCard(found, byAppId, card, extractNameFromCard(card), m[1]);
+    });
+    if (found.size > 0) {
+      log(`  Strategy 0/0b: Found ${found.size} applicant card(s) from hiring list links`);
+    }
 
     // ── Strategy 1: data-view-name on applicant items ──
-    // LinkedIn often puts data-view-name on list items
     document.querySelectorAll('[data-view-name*="applicant" i]').forEach((el) => {
-      if (!found.has(el)) {
-        const name = extractNameFromCard(el);
-        if (!isInvalidCardName(name) || name === "Unviewed_applicant") {
-          found.set(el, name);
-        }
+      if (el.closest(".hiring-applicant-header, .hiring-applicant-detail, #hiring-detail-root")) {
+        return; // detail chrome, not left-rail cards
       }
+      const appId =
+        (el.querySelector?.("a[href*='/applicants/']")?.getAttribute("href") || "").match(
+          /\/applicants\/(\d+)/
+        )?.[1] || "";
+      addApplicantCard(found, byAppId, el, extractNameFromCard(el), appId);
     });
 
-    // Skip fuzzy strategies when Hiring Manager list already matched (avoids "Message" false positives)
-    const hasHiringList = found.size > 0 && !!document.querySelector(".hiring-applicants__list-item");
+    // Skip fuzzy strategies when we already have a solid list (avoids "Message" false positives)
+    const hasHiringList = found.size >= 2;
 
     if (!hasHiringList) {
-    // Also check componentkey items (LinkedIn uses this extensively)
-    document.querySelectorAll('[componentkey]').forEach((el) => {
-      // Only cards in a list-like context, not the detail panel
-      const text = el.textContent;
-      const looksLikeCard =
-        (text.includes("Must-have") || text.includes("Preferred") ||
-         text.includes("/3") || text.includes("/5") ||
-         text.includes("1st") || text.includes("2nd") || text.includes("3rd")) &&
-        el.textContent.trim().length < 500 &&
-        el.textContent.trim().length > 20;
+      document.querySelectorAll("[componentkey]").forEach((el) => {
+        const text = el.textContent || "";
+        if (!looksLikeApplicantListCard(text)) return;
+        if (el.closest(".hiring-applicant-detail, #hiring-detail-root")) return;
 
-      // Make sure it's not the detail panel (which is larger)
-      if (looksLikeCard && !found.has(el)) {
-        // Check it's not already a child of something we found
         let isDuplicate = false;
         for (const existing of found.keys()) {
           if (existing.contains(el) || el.contains(existing)) {
@@ -217,35 +350,23 @@ if (window.__lbrd_cleanup) {
             break;
           }
         }
-        if (!isDuplicate) found.set(el, extractNameFromCard(el));
-      }
-    });
+        if (!isDuplicate) addApplicantCard(found, byAppId, el, extractNameFromCard(el), "");
+      });
     }
+
     // ── Strategy 2: Find the list container and its children ──
-    // The left panel is usually a scrollable container with repeating children
     if (found.size === 0) {
-      // Find all scrollable containers
       const allElements = document.querySelectorAll("*");
       let bestContainer = null;
       let bestScore = 0;
 
       for (const el of allElements) {
-        // A list container should have multiple similar children and be scrollable
         const children = el.children;
         if (children.length < 2) continue;
 
-        // Check if it looks like a list of applicant cards
         let matchingChildren = 0;
         for (const child of children) {
-          const text = child.textContent;
-          if (
-            (text.includes("Must-have") || text.includes("Preferred") ||
-             text.includes("/3") || text.includes("/5")) &&
-            (text.includes("1st") || text.includes("2nd") || text.includes("3rd") ||
-             text.includes("India") || text.includes("·"))
-          ) {
-            matchingChildren++;
-          }
+          if (looksLikeApplicantListCard(child.textContent || "")) matchingChildren++;
         }
 
         if (matchingChildren > bestScore) {
@@ -257,13 +378,12 @@ if (window.__lbrd_cleanup) {
       if (bestContainer && bestScore >= 2) {
         log(`  Strategy 2: Found list container with ${bestScore} applicant children`);
         for (const child of bestContainer.children) {
-          const text = child.textContent;
-          const looksLikeCard =
-            (text.includes("Must-have") || text.includes("Preferred") ||
-             text.includes("/3") || text.includes("/5")) &&
-            text.trim().length > 20 && text.trim().length < 500;
-          if (looksLikeCard && !found.has(child)) {
-            found.set(child, extractNameFromCard(child));
+          if (looksLikeApplicantListCard(child.textContent || "")) {
+            const appId =
+              (child.querySelector("a[href*='/applicants/']")?.getAttribute("href") || "").match(
+                /\/applicants\/(\d+)/
+              )?.[1] || "";
+            addApplicantCard(found, byAppId, child, extractNameFromCard(child), appId);
           }
         }
       }
@@ -274,56 +394,55 @@ if (window.__lbrd_cleanup) {
       document.querySelectorAll('[role="list"]').forEach((list) => {
         const items = list.querySelectorAll('[role="listitem"], li, [role="option"]');
         items.forEach((item) => {
-          const text = item.textContent;
-          if (
-            text.trim().length > 20 && text.trim().length < 500 &&
-            (text.includes("·") || text.includes("2nd") || text.includes("3rd") || text.includes("1st"))
-          ) {
-            if (!found.has(item)) found.set(item, extractNameFromCard(item));
+          if (looksLikeApplicantListCard(item.textContent || "")) {
+            addApplicantCard(found, byAppId, item, extractNameFromCard(item), "");
           }
         });
       });
     }
 
-    // ── Strategy 4: Anchor links with hiring/applicant URLs ──
+    // ── Strategy 4: Anchor links with hiring/applicant URLs (fallback) ──
     if (found.size === 0) {
-      document.querySelectorAll('a[href*="applicationId"], a[href*="applicant"]').forEach((a) => {
-        // Walk up to the card container
-        const card = a.closest("li") || a.closest("[componentkey]") || a.parentElement;
-        if (card && !found.has(card) && card.textContent.trim().length > 20) {
-          found.set(card, extractNameFromCard(card));
-        }
-      });
+      document
+        .querySelectorAll(
+          'a[href*="applicationId"], a[href*="/applicants/"], a[href*="applicant"]'
+        )
+        .forEach((a) => {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/applicants\/(\d+)/i) || href.match(/applicationId[=:](\d+)/i);
+          const card = cardElementFromApplicantLink(a);
+          if (card && (card.textContent || "").trim().length > 8) {
+            addApplicantCard(found, byAppId, card, extractNameFromCard(card), m?.[1] || "");
+          }
+        });
     }
 
-    // ── Strategy 5: ULTRA-broad — find siblings of the detail panel ──
+    // ── Strategy 5: ULTRA-broad — near "Applicants" / "Shortlist" heading ──
     if (found.size === 0) {
-      // The "Shortlist" or "Applicants" heading is usually above the list
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
       let textNode;
       while ((textNode = walker.nextNode())) {
         const t = textNode.textContent.trim();
-        if (t === "Shortlist" || t === "Applicants" || t === "All applicants") {
-          // Go up to find the list container near this heading
+        if (
+          t === "Shortlist" ||
+          t === "Applicants" ||
+          t === "All applicants" ||
+          /\d[\d,]*\s+applicants/i.test(t)
+        ) {
           let parent = textNode.parentElement;
-          for (let depth = 0; depth < 5 && parent; depth++) {
+          for (let depth = 0; depth < 6 && parent; depth++) {
             parent = parent.parentElement;
           }
           if (parent) {
-            // Look for repeating child patterns
-            const candidates = parent.querySelectorAll("*");
-            for (const c of candidates) {
+            for (const c of parent.querySelectorAll("*")) {
               if (
-                c.children.length === 0 || c.children.length > 10 ||
-                c.textContent.trim().length > 500 || c.textContent.trim().length < 20
-              ) continue;
-              const text = c.textContent;
-              if (
-                (text.includes("·") || text.includes("2nd") || text.includes("3rd")) &&
-                (text.includes("/3") || text.includes("/5") || text.includes("Must-have"))
+                c.children.length === 0 ||
+                c.children.length > 12 ||
+                !looksLikeApplicantListCard(c.textContent || "")
               ) {
-                if (!found.has(c)) found.set(c, extractNameFromCard(c));
+                continue;
               }
+              addApplicantCard(found, byAppId, c, extractNameFromCard(c), "");
             }
           }
           break;
@@ -336,52 +455,290 @@ if (window.__lbrd_cleanup) {
     for (const a of found.keys()) {
       for (const b of found.keys()) {
         if (a !== b && a.contains(b)) {
-          toRemove.push(a); // remove the parent
+          toRemove.push(a);
         }
       }
     }
     for (const el of toRemove) found.delete(el);
 
-    // Drop junk cards (e.g. Message button mistaken as an applicant)
     for (const [el, name] of [...found.entries()]) {
       if (isInvalidCardName(name) && name !== "Unviewed_applicant") {
         found.delete(el);
       }
     }
 
-    applicantCards = [...found].map(([el, name]) => ({ element: el, name }));
-    log(`Scan complete: ${applicantCards.length} applicant(s) found.`);
-    if (applicantCards.length > 0) {
-      log(`  Names: ${applicantCards.map((c) => c.name).join(", ")}`);
+    // ── Strategy 5b: Last-chance — unique /applicants/{id} links as cards ──
+    if (found.size < 2) {
+      const before = found.size;
+      document.querySelectorAll("a[href*='/applicants/']").forEach((a) => {
+        const href = a.getAttribute("href") || a.href || "";
+        const m = href.match(/\/hiring\/jobs\/\d+\/applicants\/(\d+)/i);
+        if (!m) return;
+        if (byAppId.has(m[1])) return;
+        const card = cardElementFromApplicantLink(a);
+        if (!card) return;
+        // Ignore tiny icon-only chrome links with no name text
+        const text = (card.textContent || "").trim();
+        if (text.length < 2) return;
+        addApplicantCard(found, byAppId, card, extractNameFromCard(card), m[1]);
+      });
+      if (found.size > before) {
+        log(`  Strategy 5b: Expanded to ${found.size} applicant(s) via unique applicant URLs`);
+      }
     }
+
+    // Re-dedupe after late strategies
+    const toRemove2 = [];
+    for (const a of found.keys()) {
+      for (const b of found.keys()) {
+        if (a !== b && a.contains(b)) toRemove2.push(a);
+      }
+    }
+    for (const el of toRemove2) found.delete(el);
+
+    // ── Strategy 6: Single-applicant detail ONLY when truly no list cards ──
+    let detailSynthetic = false;
+    if (found.size === 0 && isHiringDetailPage()) {
+      const appId = getApplicationIdFromPath();
+      const detailRoot = getDetailRootElement();
+      const detailName =
+        extractNameFromDetailPanel() ||
+        (appId ? `Application_${appId}` : "Unknown_Candidate");
+      found.set(detailRoot, detailName);
+      detailSynthetic = true;
+      log(
+        `  Strategy 6: Detail page mode — treating open applicant as 1 card (${detailName})`
+      );
+    }
+
+    applicantCards = [...found].map(([el, name]) => {
+      const link =
+        el?.querySelector?.('a[href*="/applicants/"]') ||
+        (el?.matches?.('a[href*="/applicants/"]') ? el : null);
+      const hrefRaw = link?.getAttribute?.("href") || link?.href || "";
+      const appId =
+        (hrefRaw.match(/\/applicants\/(\d+)/i) || [])[1] ||
+        getApplicationIdFromPath() ||
+        "";
+      return {
+        element: el,
+        name,
+        appId,
+        href: absoluteHref(hrefRaw) || buildApplicantDetailHref(appId),
+        isDetailSynthetic: detailSynthetic,
+      };
+    });
+    log(`Scan complete: ${applicantCards.length} applicant(s) found in the current DOM.`);
+    if (applicantCards.length > 0 && applicantCards.length <= 15) {
+      log(
+        `  Note: LinkedIn virtualizes the left list (~${applicantCards.length} visible). Start Bulk Download will scroll to collect more.`
+      );
+    }
+    if (applicantCards.length > 0) {
+      const preview = applicantCards.slice(0, 12).map((c) => c.name).join(", ");
+      log(`  Names: ${preview}${applicantCards.length > 12 ? "…" : ""}`);
+    }
+    return applicantCards.length;
+  }
+
+  /** Find the scrollable left-rail list (LinkedIn keeps only ~10 cards mounted). */
+  function findApplicantListScroller() {
+    const links = [
+      ...document.querySelectorAll('a[href*="/hiring/jobs/"][href*="/applicants/"]'),
+    ];
+    let best = null;
+    let bestScore = 0;
+
+    for (const a of links) {
+      let el = a.parentElement;
+      for (let depth = 0; depth < 14 && el; depth++) {
+        const style = window.getComputedStyle(el);
+        const oy = style.overflowY || style.overflow || "";
+        const scrollable =
+          el.scrollHeight > el.clientHeight + 50 && /(auto|scroll|overlay)/i.test(oy);
+        const linkCount = el.querySelectorAll('a[href*="/applicants/"]').length;
+        if (scrollable && linkCount >= 2) {
+          const score = linkCount * 20 + (el.scrollHeight - el.clientHeight);
+          if (score > bestScore) {
+            bestScore = score;
+            best = el;
+          }
+        }
+        el = el.parentElement;
+      }
+    }
+
+    return (
+      best ||
+      document.querySelector(
+        ".hiring-applicants__list, [class*='hiring-applicants__list'], .scaffold-layout__list, [class*='scaffold-layout__list']"
+      )
+    );
+  }
+
+  /** Harvest currently mounted list links into a Map keyed by application id. */
+  function harvestVisibleApplicants(bucket) {
+    document
+      .querySelectorAll('a[href*="/hiring/jobs/"][href*="/applicants/"]')
+      .forEach((a) => {
+        const hrefRaw = a.getAttribute("href") || a.href || "";
+        const m = hrefRaw.match(/\/applicants\/(\d+)/i);
+        if (!m) return;
+        const appId = m[1];
+        const card = cardElementFromApplicantLink(a);
+        let name = card ? extractNameFromCard(card) : "";
+        if (!name || name === "Unknown_Candidate" || isInvalidCardName(name)) {
+          name = `Application_${appId}`;
+        }
+        if (name === "Unviewed_applicant") name = `Application_${appId}`;
+        const href = absoluteHref(hrefRaw) || buildApplicantDetailHref(appId);
+        const prev = bucket.get(appId);
+        const entry = {
+          element: card?.isConnected ? card : null,
+          name,
+          appId,
+          href,
+          isDetailSynthetic: false,
+        };
+        if (!prev) {
+          bucket.set(appId, entry);
+          return;
+        }
+        // Prefer a real person name over Application_<id>
+        if (/^Application_\d+$/i.test(prev.name) && !/^Application_\d+$/i.test(name)) {
+          prev.name = name;
+        }
+        if (card?.isConnected) prev.element = card;
+        if (href) prev.href = href;
+      });
+  }
+
+  /**
+   * Scroll the left applicant rail and collect unique applicants by id.
+   * Required because LinkedIn virtualizes the list (~10 nodes in DOM at a time).
+   */
+  async function scrollCollectApplicants({ maxRounds = 100, stagnantLimit = 5 } = {}) {
+    const bucket = new Map();
+
+    for (const c of applicantCards) {
+      const appId = c.appId || extractApplicationId(c) || "";
+      if (!appId) continue;
+      bucket.set(appId, {
+        element: c.element?.isConnected ? c.element : null,
+        name: c.name || `Application_${appId}`,
+        appId,
+        href: c.href || buildApplicantDetailHref(appId),
+        isDetailSynthetic: false,
+      });
+    }
+    harvestVisibleApplicants(bucket);
+
+    const scroller = findApplicantListScroller();
+    if (!scroller) {
+      log("  No scrollable applicant list found — using currently visible cards only.");
+      applicantCards = [...bucket.values()];
+      return applicantCards.length;
+    }
+
+    log(
+      `  Scrolling left list to load more (virtualized). Starting with ${bucket.size}…`
+    );
+    notify("LOG", {
+      message: `Scrolling applicant list to collect more than the ~${bucket.size} visible in the DOM…`,
+    });
+
+    scroller.scrollTop = 0;
+    await humanPause(400, 700);
+    harvestVisibleApplicants(bucket);
+
+    let stagnant = 0;
+    let lastSize = bucket.size;
+
+    for (let round = 0; round < maxRounds && !stopRequested; round++) {
+      const step = Math.max(140, Math.floor((scroller.clientHeight || 400) * 0.9));
+      const prevTop = scroller.scrollTop;
+      scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + step);
+      try {
+        scroller.dispatchEvent(
+          new WheelEvent("wheel", { deltaY: step, bubbles: true, cancelable: true })
+        );
+      } catch (_) {}
+      await humanPause(450, 850);
+      harvestVisibleApplicants(bucket);
+
+      if (bucket.size > lastSize) {
+        if (bucket.size % 20 === 0 || bucket.size - lastSize >= 8) {
+          log(`  …collected ${bucket.size} unique applicants`);
+          notify("LOG", { message: `Collected ${bucket.size} unique applicants so far…` });
+        }
+        lastSize = bucket.size;
+        stagnant = 0;
+      } else {
+        stagnant++;
+        // If scroll position did not move, jump toward bottom
+        if (scroller.scrollTop <= prevTop + 2) {
+          scroller.scrollTop = scroller.scrollHeight;
+          await humanPause(600, 1000);
+          harvestVisibleApplicants(bucket);
+          if (bucket.size > lastSize) {
+            lastSize = bucket.size;
+            stagnant = 0;
+            continue;
+          }
+        }
+        if (stagnant >= stagnantLimit) break;
+      }
+    }
+
+    applicantCards = [...bucket.values()];
+    log(`  Scroll collect finished: ${applicantCards.length} unique applicant(s).`);
+    notify("LOG", {
+      message: `List collect done — ${applicantCards.length} unique applicant(s). Starting downloads…`,
+    });
     return applicantCards.length;
   }
 
   function extractNameFromCard(card) {
     for (const sel of [
       ".artdeco-entity-lockup__title",
+      ".artdeco-entity-lockup__title span",
+      '[data-test-row-lockup-full-name]',
       "h2", "h3", "h4",
       'a[href*="/in/"]',
       'a[href*="/talent/profile/"]',
+      'a[href*="/applicants/"]',
     ]) {
       const el = card.querySelector(sel);
       if (el) {
         const raw = (el.childNodes[0]?.textContent || el.textContent).trim();
         if (raw.length > 1 && raw.length < 60) {
           if (/unviewed\s+applicant/i.test(raw)) return "Unviewed_applicant";
+          if (/^see more jobs$/i.test(raw)) continue;
           const cleaned = sanitiseName(
-            raw.replace(/[·•].*$/, "").replace(/['’]s application$/i, "").trim()
+            raw
+              .replace(/[·•].*$/, "")
+              .replace(/['’]s application$/i, "")
+              .replace(/\b(1st|2nd|3rd)\b.*$/i, "")
+              .trim()
           );
-          if (cleaned) return cleaned;
+          if (cleaned && cleaned.toLowerCase() !== "see_more_jobs") return cleaned;
         }
       }
     }
 
     const text = card.textContent.trim();
-    const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    const lines = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(
+        (l) =>
+          l.length > 0 &&
+          !/^see more jobs$/i.test(l) &&
+          !/^(1st|2nd|3rd)$/i.test(l)
+      );
     if (lines.length > 0) {
       let name = lines[0];
-      name = name.replace(/[·•].*$/, "").trim();
+      name = name.replace(/[·•].*$/, "").replace(/\b(1st|2nd|3rd)\b.*$/i, "").trim();
       if (/unviewed\s+applicant/i.test(name)) return "Unviewed_applicant";
       if (name.length > 1 && name.length < 60) return sanitiseName(name);
     }
@@ -420,8 +777,42 @@ if (window.__lbrd_cleanup) {
   }
 
   function isHiringManagerUI() {
+    if (/\/hiring\/jobs\//i.test(location.pathname)) return true;
     return !!document.querySelector(
-      ".hiring-applicants__list-item, .hiring-applicant-header, .hiring-resume-viewer__pdf-download-link-icon, .ui-attachment__download-button"
+      ".hiring-applicants__list-item, .hiring-applicant-header, .hiring-resume-viewer__pdf-download-link-icon, .ui-attachment__download-button, .hiring-applicant-detail, #hiring-detail-root"
+    );
+  }
+
+  function isLikelyResumeHref(href) {
+    if (!href) return false;
+    const h = href.toLowerCase();
+    if (
+      h.includes("/in/") ||
+      h.startsWith("javascript:") ||
+      h === "#" ||
+      h.endsWith("#") ||
+      h.includes("profile-displayphoto") ||
+      h.includes("company-logo")
+    ) {
+      return false;
+    }
+    return (
+      h.includes("mediaauth") ||
+      h.includes("/dms/") ||
+      h.includes("linkedin.com/ambry") ||
+      /\.pdf(\?|#|$)/i.test(href) ||
+      (h.includes("media.licdn.com") && (h.includes("pdf") || h.includes("document") || h.includes("resume")))
+    );
+  }
+
+  function getResumeSearchRoot() {
+    return (
+      document.querySelector(".hiring-resume-viewer") ||
+      document.querySelector(".hiring-applicant-detail") ||
+      document.querySelector("#hiring-detail-root") ||
+      document.querySelector(".hiring-applicants__right-column") ||
+      document.querySelector(".scaffold-layout__detail") ||
+      document
     );
   }
 
@@ -430,16 +821,19 @@ if (window.__lbrd_cleanup) {
    * Real download controls:
    *   .ui-attachment__download-button
    *   .hiring-resume-viewer__pdf-download-link-icon → closest <a>
+   *   text / mediaAuth / .pdf / dms links in the detail region
    */
   function getHiringResumeDownloadUrl() {
-    const attachment = document.querySelector("a.ui-attachment__download-button, .ui-attachment__download-button");
+    const attachment = document.querySelector(
+      "a.ui-attachment__download-button, .ui-attachment__download-button, a[class*='ui-attachment'][href]"
+    );
     if (attachment && attachment.href && !attachment.href.includes("/in/")) {
       log("  ✓ Hiring resume URL via ui-attachment__download-button");
       return attachment.href;
     }
 
     const icon = document.querySelector(
-      ".hiring-resume-viewer__pdf-download-link-icon, svg.hiring-resume-viewer__pdf-download-link-icon"
+      ".hiring-resume-viewer__pdf-download-link-icon, svg.hiring-resume-viewer__pdf-download-link-icon, [class*='resume-viewer'][class*='download'] svg, svg[id='download-small']"
     );
     if (icon) {
       const link = icon.closest("a");
@@ -456,14 +850,33 @@ if (window.__lbrd_cleanup) {
       const text = (a.textContent || "").toLowerCase();
       if (
         (text.includes("download") && text.includes("resume")) ||
-        href.includes("mediaauth") ||
-        href.includes(".pdf") ||
-        href.includes("dms/")
+        isLikelyResumeHref(a.href)
       ) {
         if (!href.includes("/in/")) {
           log("  ✓ Hiring resume URL via More dropdown");
           return a.href;
         }
+      }
+    }
+
+    // Broader: download-labelled anchors and media/pdf links in the detail region
+    const root = getResumeSearchRoot();
+    const anchors = root.querySelectorAll
+      ? root.querySelectorAll("a[href]")
+      : document.querySelectorAll("a[href]");
+    for (const a of anchors) {
+      const text = (a.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const aria = (a.getAttribute("aria-label") || "").toLowerCase();
+      const labelledDownload =
+        (text.includes("download") && (text.includes("resume") || text === "download")) ||
+        (aria.includes("download") && (aria.includes("resume") || aria.includes("pdf")));
+      if (labelledDownload && a.href && !a.href.includes("/in/")) {
+        log("  ✓ Hiring resume URL via download-labelled anchor");
+        return a.href;
+      }
+      if (isLikelyResumeHref(a.href)) {
+        log("  ✓ Hiring resume URL via media/pdf/dms link");
+        return a.href;
       }
     }
 
@@ -482,16 +895,22 @@ if (window.__lbrd_cleanup) {
     return /Scanning resume for viruses/i.test(text);
   }
 
-  /** applicationId from card link — used when name is still "Unviewed applicant". */
+  /** applicationId from card meta, link, or detail URL — used when name is still "Unviewed applicant". */
   function extractApplicationId(card) {
+    if (card?.appId) return String(card.appId);
     const el = card?.element || card;
-    if (!el || !el.querySelectorAll) return "";
-    for (const a of el.querySelectorAll("a[href]")) {
-      const href = a.getAttribute("href") || "";
-      const m = href.match(/applicationId[=:](\d+)/i) || href.match(/\/applicants\/(\d+)/);
+    if (el && el.querySelectorAll) {
+      for (const a of el.querySelectorAll("a[href]")) {
+        const href = a.getAttribute("href") || "";
+        const m = href.match(/applicationId[=:](\d+)/i) || href.match(/\/applicants\/(\d+)/);
+        if (m) return m[1];
+      }
+    }
+    if (card?.href) {
+      const m = String(card.href).match(/\/applicants\/(\d+)/i);
       if (m) return m[1];
     }
-    return "";
+    return getApplicationIdFromPath();
   }
 
   /**
@@ -631,29 +1050,73 @@ if (window.__lbrd_cleanup) {
   // ══════════════════════════════════════════════════════════
 
   async function selectApplicant(card) {
-    const el = card.element;
+    const appId = card.appId || extractApplicationId(card) || "";
 
-    // Prefer list-item anchor; avoid "See full profile" (/in/...) links
-    const anchors = [...el.querySelectorAll("a")].filter((a) => {
-      const href = a.getAttribute("href") || "";
-      return href && !href.includes("/in/") && !/see full profile/i.test(a.textContent || "");
-    });
+    // Already viewing this applicant (detail synthetic or URL match)
+    if (
+      card.isDetailSynthetic ||
+      (appId && getApplicationIdFromPath() === appId) ||
+      (isHiringDetailPage() && applicantCards.length === 1 && !appId)
+    ) {
+      log("  Already on applicant detail page — skipping list click");
+      await humanPause(400, 900);
+      return;
+    }
 
-    const clickTarget =
-      el.querySelector("a.hiring-applicants__list-item-link") ||
-      el.querySelector('a[href*="applicationId"]') ||
-      el.querySelector('a[href*="applicant"]') ||
-      el.querySelector('a[href*="/hiring/"]') ||
-      anchors[0] ||
-      el.querySelector("a") ||
-      el;
+    // Re-find live DOM node (virtualized list recycles elements)
+    let el = card.element?.isConnected ? card.element : null;
+    let liveLink = null;
+    if (appId) {
+      liveLink = document.querySelector(`a[href*="/applicants/${appId}"]`);
+      if (!el && liveLink) el = cardElementFromApplicantLink(liveLink);
+      if (el?.isConnected) card.element = el;
+    }
 
-    log(`  Clicking: <${clickTarget.tagName}> "${clickTarget.textContent.trim().substring(0, 40)}…"`);
+    if (el?.isConnected) {
+      const anchors = [...el.querySelectorAll("a")].filter((a) => {
+        const href = a.getAttribute("href") || "";
+        return href && !href.includes("/in/") && !/see full profile/i.test(a.textContent || "");
+      });
 
-    await humanClick(clickTarget);
+      const clickTarget =
+        (appId && el.querySelector(`a[href*="/applicants/${appId}"]`)) ||
+        el.querySelector("a.hiring-applicants__list-item-link") ||
+        el.querySelector('a[href*="applicationId"]') ||
+        el.querySelector('a[href*="/applicants/"]') ||
+        el.querySelector('a[href*="/hiring/"]') ||
+        anchors[0] ||
+        el.querySelector("a") ||
+        el;
 
-    // Hiring Manager Ember UI needs more time for detail + resume viewer
-    await humanPause(1500, 3500);
+      log(
+        `  Clicking: <${clickTarget.tagName}> "${(clickTarget.textContent || "")
+          .trim()
+          .substring(0, 40)}…"`
+      );
+      await humanClick(clickTarget);
+      await humanPause(1500, 3500);
+      return;
+    }
+
+    // Card scrolled out of DOM — open via stored / built detail URL
+    const href = card.href || (liveLink ? absoluteHref(liveLink.href) : "") || buildApplicantDetailHref(appId);
+    if (!href) {
+      throw new Error("Applicant card no longer in DOM and no detail URL available");
+    }
+    log(`  List virtualized — opening applicant via URL…`);
+    const a = document.createElement("a");
+    a.href = href;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    const start = Date.now();
+    while (Date.now() - start < 10000) {
+      if (appId && getApplicationIdFromPath() === appId) break;
+      await sleep(300);
+    }
+    await humanPause(1200, 2200);
   }
 
 
@@ -1104,16 +1567,37 @@ if (window.__lbrd_cleanup) {
 
   async function startBulkDownload() {
     stopRequested = false;
-    const total = applicantCards.length;
-    let downloaded = 0, failed = 0;
-    const hiringUI = isHiringManagerUI();
-
-    log(`Starting bulk download for ${total} applicant(s)…`);
-    log(`  Detected UI: ${hiringUI ? "Hiring Manager (Jobs applicants)" : "Talent Hub / Recruiter-style"}`);
     applicantsSinceLongBreak = 0;
     const virusRetryQueue = []; // cards blocked by virus scan on first pass
 
+    // LinkedIn only mounts ~10 list cards at a time — scroll-collect unique ids first
+    log("Phase 0: Expanding virtualized applicant list…");
+    notify("LOG", {
+      message:
+        "Scrolling the left applicant list to collect everyone LinkedIn will load (only ~10 stay in the DOM at once)…",
+    });
+    scanApplicantCards();
+    await scrollCollectApplicants({ maxRounds: 120, stagnantLimit: 6 });
+
+    const total = applicantCards.length;
+    let downloaded = 0,
+      failed = 0;
+    const hiringUI = isHiringManagerUI();
+
+    if (total === 0) {
+      log("No applicants collected — nothing to download.");
+      notify("DONE", { downloaded: 0, total: 0, failed: 0 });
+      chrome.runtime.sendMessage({ type: "DOWNLOAD_STOPPED" }).catch(() => {});
+      return;
+    }
+
+    log(`Starting bulk download for ${total} applicant(s)…`);
+    log(
+      `  Detected UI: ${hiringUI ? "Hiring Manager (Jobs applicants)" : "Talent Hub / Recruiter-style"}`
+    );
+
     chrome.runtime.sendMessage({ type: "DOWNLOAD_STARTED", total }).catch(() => {});
+    notify("PROGRESS", { downloaded: 0, total, failed: 0 });
 
     for (let i = 0; i < applicantCards.length; i++) {
       if (stopRequested) {
@@ -1394,39 +1878,55 @@ if (window.__lbrd_cleanup) {
   //  DEBUG SCAN — dumps actual DOM structure
   // ══════════════════════════════════════════════════════════
 
-  function debugScan() {
+  async function debugScan() {
     const info = { url: window.location.href };
+    info.isDetailPage = isHiringDetailPage();
+    info.applicationIdFromPath = getApplicationIdFromPath() || null;
 
     const count = scanApplicantCards();
     info.applicantCardsFound = count;
     info.applicantNames = applicantCards.map((c) => c.name);
+    info.detailMode = applicantCards.some((c) => c.isDetailSynthetic);
 
     info.totalButtons = document.querySelectorAll("button").length;
     info.totalLinks = document.querySelectorAll("a[href]").length;
     info.hiringListItems = document.querySelectorAll(".hiring-applicants__list-item").length;
     info.hiringUI = isHiringManagerUI();
 
-    const hiringUrl = getHiringResumeDownloadUrl();
+    // On detail pages, wait briefly for late-mounted resume controls
+    let hiringUrl = getHiringResumeDownloadUrl();
+    if (!hiringUrl && info.isDetailPage) {
+      hiringUrl = await waitForHiringResumeUrl(5000);
+    }
     info.hiringResumeUrlFound = !!hiringUrl;
     info.hiringResumeUrlPreview = hiringUrl ? hiringUrl.substring(0, 100) : null;
-    info.uiAttachmentDownload = !!document.querySelector(".ui-attachment__download-button");
-    info.resumeViewerDownloadIcon = !!document.querySelector(".hiring-resume-viewer__pdf-download-link-icon");
+    info.uiAttachmentDownload = !!document.querySelector(
+      ".ui-attachment__download-button, a[class*='ui-attachment'][href]"
+    );
+    info.resumeViewerDownloadIcon = !!document.querySelector(
+      ".hiring-resume-viewer__pdf-download-link-icon, svg.hiring-resume-viewer__pdf-download-link-icon, svg[id='download-small']"
+    );
 
     const resumeBtn = document.querySelector('button[data-view-name="hiring-applicant-view-resume"]');
-    info.resumeButtonVisible = !!resumeBtn || info.uiAttachmentDownload || info.resumeViewerDownloadIcon;
+    info.resumeButtonVisible =
+      !!resumeBtn || info.uiAttachmentDownload || info.resumeViewerDownloadIcon || !!hiringUrl;
     info.resumeButtonText = resumeBtn
       ? resumeBtn.textContent.trim().substring(0, 40)
       : (info.uiAttachmentDownload
           ? "ui-attachment__download-button"
-          : (info.resumeViewerDownloadIcon ? "hiring-resume-viewer download icon" : ""));
+          : (info.resumeViewerDownloadIcon
+              ? "hiring-resume-viewer download icon"
+              : (hiringUrl ? "media/pdf link" : "")));
 
     info.documentIconVisible = !!document.querySelector('svg[id="document-small"]');
     info.downloadIconVisible =
       !!document.querySelector('svg[id="download-small"]') ||
       info.uiAttachmentDownload ||
-      info.resumeViewerDownloadIcon;
+      info.resumeViewerDownloadIcon ||
+      !!hiringUrl;
 
     info.detailPanelName = extractNameFromDetailPanel();
+    info.virusScanBlocking = isVirusScanBlocking();
 
     info.dataViewButtons = [];
     info.dataViewElements = [];
@@ -1453,12 +1953,29 @@ if (window.__lbrd_cleanup) {
 
     info.applicationLinks = [];
     document.querySelectorAll(
-      '.hiring-applicants__list-item a, a[href*="applicationId"], a[href*="applicant"]'
+      '.hiring-applicants__list-item a, a[href*="applicationId"], a[href*="applicant"], a[href*="/hiring/jobs/"]'
     ).forEach((a) => {
       info.applicationLinks.push({
         href: a.href.substring(0, 120),
         text: a.textContent.trim().substring(0, 60),
       });
+    });
+
+    // Surface PDF / media links so markup drift is visible without DevTools
+    info.resumeLikeLinks = [];
+    document.querySelectorAll("a[href]").forEach((a) => {
+      const text = (a.textContent || "").replace(/\s+/g, " ").trim();
+      const aria = a.getAttribute("aria-label") || "";
+      const labelled =
+        /download/i.test(text) || /download/i.test(aria) || /resume/i.test(text);
+      if (isLikelyResumeHref(a.href) || labelled) {
+        if (info.resumeLikeLinks.length < 15) {
+          info.resumeLikeLinks.push({
+            href: a.href.substring(0, 120),
+            text: (text || aria).substring(0, 60),
+          });
+        }
+      }
     });
 
     return info;
@@ -1472,11 +1989,24 @@ if (window.__lbrd_cleanup) {
 
   function messageHandler(msg, _sender, sendResponse) {
     switch (msg.action) {
-      case "SCAN_RESUMES": sendResponse({ count: scanApplicantCards() }); break;
-      case "DEBUG_SCAN": sendResponse({ debug: debugScan() }); break;
-      case "START_DOWNLOAD": startBulkDownload(); sendResponse({ ok: true }); break;
-      case "STOP_DOWNLOAD": stopRequested = true; sendResponse({ ok: true }); break;
-      default: sendResponse({ ok: false });
+      case "SCAN_RESUMES":
+        sendResponse({ count: scanApplicantCards() });
+        break;
+      case "DEBUG_SCAN":
+        debugScan()
+          .then((debug) => sendResponse({ debug }))
+          .catch((err) => sendResponse({ debug: null, error: String(err) }));
+        return true; // async
+      case "START_DOWNLOAD":
+        startBulkDownload();
+        sendResponse({ ok: true });
+        break;
+      case "STOP_DOWNLOAD":
+        stopRequested = true;
+        sendResponse({ ok: true });
+        break;
+      default:
+        sendResponse({ ok: false });
     }
     return true;
   }
@@ -1484,5 +2014,5 @@ if (window.__lbrd_cleanup) {
   chrome.runtime.onMessage.addListener(messageHandler);
   window.__lbrd_cleanup = () => chrome.runtime.onMessage.removeListener(messageHandler);
 
-  console.log("[LBRD] Content script v6 loaded (Hiring Manager + Talent Hub).");
+  console.log("[LBRD] Content script v8 loaded (Hiring Manager + scroll-collect + Talent Hub).");
 })();
