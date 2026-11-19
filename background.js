@@ -94,7 +94,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           };
           pendingPdfDownload = null;
         }
-      }, 30000),
+      }, 60000),
     };
     console.log(`[LBRD] Watching for PDF tab for: ${msg.candidateName} (source tab: ${pendingPdfDownload.sourceTabId})`);
     sendResponse({ ok: true });
@@ -182,41 +182,46 @@ async function handleNewTabUrl(tabId, url) {
     return;
   }
 
+  // Avoid racing: if we already started handling this tab, skip
+  if (pendingPdfDownload.handlingTabId === tabId) return;
+  pendingPdfDownload.handlingTabId = tabId;
+
   const candidateName = pendingPdfDownload.candidateName;
   const filename = buildFilename(candidateName);
   console.log(`[LBRD] PDF tab detected (tabId=${tabId}): ${url.substring(0, 120)}`);
-  clearPdfWatch();
 
   let saved = false;
+  let finalUrl = url;
 
-  // Strategy 1: Try to download from within the tab using fetch+blob
-  // (the tab already has the PDF loaded, so re-fetching from same origin works)
   try {
-    // Wait a moment for the tab to finish loading / virus interstitial to settle
-    await sleep(2500);
+    // Settle + wait out virus-scan interstitial before clearing the watch
+    await sleep(2000 + Math.floor(Math.random() * 2000)); // 2–4s
 
     const results = await chrome.scripting.executeScript({
       target: { tabId: tabId },
       func: async (fname) => {
         try {
-          // If LinkedIn shows a virus-scan / interstitial page, wait briefly for redirect
+          // Wait until LinkedIn virus-scan interstitial clears or we get real PDF bytes
           const start = Date.now();
-          while (Date.now() - start < 8000) {
+          const maxWait = 20000;
+          while (Date.now() - start < maxWait) {
             const bodyText = (document.body && document.body.innerText) || "";
-            if (/Scanning resume for viruses|scan.*virus/i.test(bodyText)) {
-              await new Promise((r) => setTimeout(r, 500));
+            const scanning = /Scanning resume for viruses|scan.*virus|Please refresh/i.test(bodyText);
+            if (scanning) {
+              await new Promise((r) => setTimeout(r, 700 + Math.floor(Math.random() * 500)));
               continue;
             }
             break;
           }
 
-          const resp = await fetch(window.location.href, { credentials: "include" });
-          if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` };
+          const pageUrl = window.location.href;
+          const resp = await fetch(pageUrl, { credentials: "include" });
+          if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}`, url: pageUrl };
           const buf = await resp.arrayBuffer();
           const head = new Uint8Array(buf.slice(0, 4));
           const isPdf = head[0] === 0x25 && head[1] === 0x50 && head[2] === 0x44 && head[3] === 0x46;
           if (!isPdf) {
-            return { ok: false, error: "Tab content is not a PDF yet" };
+            return { ok: false, error: "Tab content is not a PDF yet", url: pageUrl };
           }
           const blob = new Blob([buf], { type: "application/pdf" });
           const u = URL.createObjectURL(blob);
@@ -227,28 +232,40 @@ async function handleNewTabUrl(tabId, url) {
           a.click();
           a.remove();
           setTimeout(() => URL.revokeObjectURL(u), 15000);
-          return { ok: true };
+          return { ok: true, url: pageUrl };
         } catch (e) {
-          return { ok: false, error: e.message };
+          return { ok: false, error: e.message, url: window.location.href };
         }
       },
       args: [filename],
     });
 
     const r = results?.[0]?.result;
+    if (r && r.url) finalUrl = r.url;
+
     if (r && r.ok) {
       console.log(`[LBRD] In-tab fetch+download succeeded for: ${filename}`);
       saved = true;
     } else {
       console.log(`[LBRD] In-tab fetch failed (${r?.error}), falling back to chrome.downloads`);
-      await triggerDownload(url, filename);
-      saved = true;
+      // Only fall back if we are past the interstitial; otherwise mark error
+      if (r && /not a PDF|virus|scan|refresh/i.test(r.error || "")) {
+        lastPdfTabResult = {
+          candidateName: "",
+          error: r.error || "PDF not ready after virus scan wait",
+          at: Date.now(),
+        };
+        saved = false;
+      } else {
+        await triggerDownload(finalUrl, filename);
+        saved = true;
+      }
     }
   } catch (err) {
     // executeScript might fail on chrome:// PDF viewer pages
     console.log(`[LBRD] executeScript failed (${err.message}), falling back to chrome.downloads`);
     try {
-      await triggerDownload(url, filename);
+      await triggerDownload(finalUrl, filename);
       saved = true;
     } catch (dlErr) {
       lastPdfTabResult = {
@@ -260,15 +277,17 @@ async function handleNewTabUrl(tabId, url) {
     }
   }
 
+  clearPdfWatch();
+
   if (saved) {
     lastPdfTabResult = { candidateName, error: "", at: Date.now() };
     pushLog(`✓ Tab watcher saved: ${candidateName}`);
   }
 
-  // Close the PDF tab after download starts
+  // Close the PDF tab only after we attempted save (longer if failed mid-scan)
   setTimeout(() => {
     chrome.tabs.remove(tabId).catch(() => {});
-  }, 3000);
+  }, saved ? 2500 : 5000);
 }
 
 chrome.tabs.onCreated.addListener((tab) => {
@@ -322,8 +341,8 @@ async function processQueue() {
       reject(err);
     }
 
-    // Small gap between downloads to prevent Chrome from throttling
-    await sleep(500);
+    // Uneven gap between downloads (less metronomic than a fixed 500ms)
+    await sleep(800 + Math.floor(Math.random() * 1200));
   }
 
   isProcessingQueue = false;
